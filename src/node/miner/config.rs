@@ -20,6 +20,8 @@ pub struct MiningConfig {
     pub gas_limit: Option<u64>,
     /// Mining interval in milliseconds
     pub mining_interval_ms: Option<u64>,
+    /// Submit built payload to the import service
+    pub submit_built_payload: bool,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -52,6 +54,7 @@ impl Default for MiningConfig {
             private_key_hex: None,
             gas_limit: Some(30_000_000),
             mining_interval_ms: Some(500),
+            submit_built_payload: false,
         }
     }
 }
@@ -80,6 +83,21 @@ impl MiningConfig {
         self.enabled && (self.keystore_path.is_some() || self.private_key_hex.is_some())
     }
 
+    /// Get the desired gas limit for the specified chain ID.
+    /// Returns the configured gas_limit if set, otherwise returns chain-specific defaults:
+    /// - BSC Mainnet (56): 140M
+    /// - BSC Testnet (97): 100M  
+    /// - Local/Other: 40M
+    pub fn get_gas_limit(&self, chain_id: u64) -> u64 {
+        self.gas_limit.unwrap_or({
+            match chain_id {
+                56 => 140_000_000,  // BSC mainnet
+                97 => 100_000_000,  // BSC testnet  
+                _ => 40_000_000,    // Local development
+            }
+        })
+    }
+
     /// Generate a new validator configuration with random keys
     pub fn generate_for_development() -> Self {
         // use rand::Rng;
@@ -103,6 +121,7 @@ impl MiningConfig {
                 keystore_password: None,
                 gas_limit: Some(30_000_000),
                 mining_interval_ms: Some(500),
+                submit_built_payload: false,
             }
         } else {
             // Fallback to default if key generation fails
@@ -124,11 +143,11 @@ impl MiningConfig {
             self.private_key_hex = generated.private_key_hex;
             
             if let Some(addr) = self.validator_address {
-                tracing::warn!("🔑 AUTO-GENERATED validator keys for development:");
-                tracing::warn!("📍 Validator Address: {}", addr);
-                tracing::warn!("🔐 Private Key: {} (KEEP SECURE!)", 
+                tracing::warn!("AUTO-GENERATED validator keys for development:");
+                tracing::warn!("Validator Address: {}", addr);
+                tracing::warn!("Private Key: {} (KEEP SECURE!)", 
                     self.private_key_hex.as_ref().unwrap());
-                tracing::warn!("⚠️  These are DEVELOPMENT keys - do not use in production!");
+                tracing::warn!("These are DEVELOPMENT keys - do not use in production!");
             }
         }
         
@@ -162,6 +181,11 @@ impl MiningConfig {
             .ok()
             .and_then(|v| v.parse().ok());
 
+        let submit_built_payload = std::env::var("BSC_SUBMIT_BUILT_PAYLOAD")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -169,6 +193,7 @@ impl MiningConfig {
             keystore_password,
             gas_limit,
             mining_interval_ms,
+            submit_built_payload,
             ..Default::default()
         };
 

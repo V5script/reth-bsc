@@ -1,9 +1,6 @@
 use super::handle::ImportHandle;
 use crate::{
-    chainspec::BscChainSpec,
-    consensus::{ParliaConsensusErr, parlia::vote_pool},
-    node::{engine_api::payload::BscPayloadTypes, network::BscNewBlock, consensus::BscForkChoiceEngine},
-    BscBlock, BscBlockBody,
+    BscBlock, BscBlockBody, chainspec::BscChainSpec, consensus::{ParliaConsensusErr, parlia::vote_pool}, node::{consensus::BscForkChoiceEngine, engine::BscBuiltPayload, engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache, network::BscNewBlock}
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
@@ -20,13 +17,15 @@ use reth_network::{
 };
 use reth_network_api::PeerId;
 use reth_node_ethereum::EthEngineTypes;
+use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, EngineApiMessageVersion, PayloadTypes};
 use reth_primitives::NodePrimitives;
 use reth_primitives_traits::{AlloyBlockHeader, Block};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
-use reth_eth_wire::{GetBlockHeaders, BlockHashNumber};
+use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_network::{NetworkHandle, message::{PeerResponse, BlockRequest}, FetchClient};
+use schnellru::{ByLength, LruMap};
 use std::{
     future::Future,
     pin::Pin,
@@ -50,11 +49,17 @@ type ImportFut = Pin<Box<dyn Future<Output = Option<Outcome>> + Send + Sync>>;
 /// Channel message type for incoming blocks
 pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 
+/// Channel message type for incoming mined blocks
+pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
+
 /// Channel message type for incoming block hashes
 pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
+
+/// Cooldown duration for downloading block hashes to avoid re-downloading the same block.
+const DOWNLOAD_COOLDOWN_DURATION_MS: u128 = 200;
 
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
@@ -69,6 +74,8 @@ where
     forkchoice_engine: BscForkChoiceEngine<Provider>,
     /// Receive the new block from the network
     from_network: UnboundedReceiver<IncomingBlock>,
+    /// Receive the new block from the network
+    from_builder: UnboundedReceiver<IncomingMinedBlock>,
     /// Receive block hashes from the network for downloading
     from_hashes: UnboundedReceiver<IncomingHashes>,
     /// Send the event of the import to the network
@@ -77,6 +84,8 @@ where
     pending_imports: FuturesUnordered<ImportFut>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
+    /// Cache of downloading block hashes to avoid re-downloading the same block.
+    downloading_blocks: LruMap<B256, u128, ByLength>,
 }
 
 impl<Provider> ImportService<Provider>
@@ -89,6 +98,7 @@ where
         chain_spec: Arc<BscChainSpec>,
         engine: ConsensusEngineHandle<BscPayloadTypes>,
         from_network: UnboundedReceiver<IncomingBlock>,
+        from_builder: UnboundedReceiver<IncomingMinedBlock>,
         from_hashes: UnboundedReceiver<IncomingHashes>,
         to_network: UnboundedSender<ImportEvent>,
     ) -> Self {
@@ -106,10 +116,12 @@ where
             engine,
             forkchoice_engine,
             from_network,
+            from_builder,
             from_hashes,
             to_network,
             pending_imports: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
+            downloading_blocks: LruMap::new(ByLength::new(LRU_PROCESSED_BLOCKS_SIZE)),
         }
     }
 
@@ -126,7 +138,7 @@ where
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
-                        tracing::debug!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
+                        tracing::trace!(target: "bsc::block_import", "New payload is valid, block = {:?}, peer_id = {:?}", block, peer_id);
                         // handle fork choice update with valid payload
                         if let Err(e) = forkchoice_engine.update_forkchoice(&header).await {
                             tracing::warn!(target: "bsc::block_import", "Failed to update fork choice: {}", e);
@@ -147,13 +159,47 @@ where
     }
 
     /// Add a new block import task to the pending imports
-    fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
-        // When bench-test feature is enabled, skip block import processing
-        #[cfg(feature = "bench-test")]
-        {
-            return;
+    fn on_new_mined_block(&mut self, payload: BscBuiltPayload, block_msg: NewBlockMessage<BscNewBlock>) {
+        // insert header to cache
+        insert_header_to_cache(block_msg.block.0.block.header.clone());
+        // Cache the full block body for later range responses.
+        crate::shared::cache_full_block(block_msg.block.0.block.clone());
+        let block_hash = block_msg.hash;
+        // Clone header for FCU update
+        let header_for_fcu = block_msg.block.0.block.header.clone();
+
+        // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block: block_msg.clone() }));
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
+        
+        // Broadcast built payload event for fast consumers
+        if let Some(tx) = crate::shared::get_payload_events_tx() {
+            tracing::debug!(target: "bsc::block_import", "Sending built payload event for mined block: {:?}", block_hash);
+            let _ = tx.send(Events::<BscPayloadTypes>::BuiltPayload(payload));
+        } else {
+            tracing::warn!("Failed to send mined block due to payload events channel not initialised");
         }
         
+        // Update fork choice for the mined block
+        {
+            let forkchoice_engine = self.forkchoice_engine.clone();
+            tokio::spawn(async move {
+                tracing::debug!(target: "bsc::block_import", "Updating fork choice for mined block: number = {:?}, hash = {:?}", header_for_fcu.number, header_for_fcu.hash_slow());
+                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
+                    tracing::warn!(target: "bsc::block_import", "Failed to update fork choice for mined block: number = {:?}, hash = {:?}, error = {}", header_for_fcu.number, header_for_fcu.hash_slow(), e);
+                }
+            });
+        }
+        // Cache the block hash to avoid re-processing the same block.
+        self.processed_blocks.insert(block_hash);
+    }
+
+    /// Add a new block import task to the pending imports
+    fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         if self.processed_blocks.contains(&block.hash) {
             return;
         }
@@ -173,18 +219,65 @@ where
         let hash_numbers = hashes.0.clone();
         
         for hash_number in hash_numbers {
+            // Skip if the block is already processed.
             if self.processed_blocks.contains(&hash_number.hash) {
                 continue;
             }
 
-            tracing::trace!(
+            // Check if the block is already being downloaded, if it times out, download it again.
+            let now = std::time::Instant::now().elapsed().as_millis();
+            if let Some(last_requested) = self.downloading_blocks.get(&hash_number.hash) {
+                if *last_requested + DOWNLOAD_COOLDOWN_DURATION_MS < now {
+                    continue;
+                }
+            }
+
+            tracing::debug!(
                 target: "bsc::block_import",
                 peer_id = %peer_id,
                 block_hash = %hash_number.hash,
                 block_number = hash_number.number,
-                "Requesting block download by simulating FCU for NewBlockHashes"
+                "Requesting block download for NewBlockHashes"
             );
 
+            // TODO: avoid to fetch too frequently, maybe add a cooldown mechanism.
+            // Try quick range fetch via BSC subprotocol (mimic geth asyncFetchRangeBlocks)
+            // Prefer the announcing peer; if it doesn't have bsc extension, fallback to any bsc peer.
+            {
+                let start_height = hash_number.number;
+                let start_hash = hash_number.hash;
+                let announcing_peer = peer_id;
+                // Resolve target bsc peer
+                let target_peer = if crate::node::network::bsc_protocol::registry::has_registered_peer(announcing_peer) {
+                    Some(announcing_peer)
+                } else {
+                    crate::node::network::bsc_protocol::registry::list_registered_peers().into_iter().next()
+                };
+                if let Some(bsc_peer) = target_peer {
+                    tracing::debug!(
+                        target: "bsc::block_import",
+                        peer_id = %bsc_peer,
+                        block_hash = %start_hash,
+                        block_number = start_height,
+                        "Requesting block with block range for NewBlockHashes"
+                    );
+                    tokio::spawn(async move {
+                        use std::time::Duration;
+                        // Bump request timeout to 1000ms to accommodate slower peers
+                        let req_timeout = Duration::from_millis(DOWNLOAD_COOLDOWN_DURATION_MS as u64);
+                        let _ = crate::node::network::bsc_protocol::registry::batch_request_range_and_await_import(
+                            bsc_peer,
+                            start_height,
+                            start_hash,
+                            1,
+                            req_timeout,
+                        ).await;
+                    });
+                }
+            }
+
+            // TODO: remove older block download mechanism currently, 
+            // may download block with TreeEvent::Download(DownloadRequest::single_block(target)
             let forkchoice_state = ForkchoiceState {
                 head_block_hash: hash_number.hash,
                 safe_block_hash: B256::ZERO, 
@@ -216,7 +309,7 @@ where
             });
 
             self.pending_imports.push(download_fut);
-            self.processed_blocks.insert(hash_number.hash);
+            self.downloading_blocks.insert(hash_number.hash, now);
         }
     }
 }
@@ -235,6 +328,11 @@ where
             this.on_new_block(block, peer_id);
         }
 
+        // Receive new mined blocks from builder
+        while let Poll::Ready(Some((payload, block_msg))) = this.from_builder.poll_recv(cx) {
+            this.on_new_mined_block(payload, block_msg);
+        }
+
         // Receive new block hashes from network
         while let Poll::Ready(Some((hashes, peer_id))) = this.from_hashes.poll_recv(cx) {
             this.on_new_block_hashes(hashes, peer_id);
@@ -245,6 +343,8 @@ where
             if let Some(outcome) = outcome {
                 if let Ok(BlockValidation::ValidBlock { block }) = &outcome.result {
                     this.processed_blocks.insert(block.hash);
+                    // Cache the full block body for later range responses.
+                    crate::shared::cache_full_block(block.block.0.block.clone());
                     // If from proxied validators, target EVN peers with ETH NewBlockHashes.
                     if let Some(cfg) = crate::node::network::evn::get_global_evn_config() {
                         let header_ref = &block.block.0.block.header;
@@ -545,6 +645,7 @@ mod tests {
             handle_engine_msg(from_engine, responses).await;
 
             let (to_import, from_network) = mpsc::unbounded_channel();
+            let (to_import_mined, from_builder) = mpsc::unbounded_channel();
             let (to_hashes, from_hashes) = mpsc::unbounded_channel();
             let (to_network, import_outcome) = mpsc::unbounded_channel();
 
@@ -555,6 +656,7 @@ mod tests {
                 chain_spec,
                 engine_handle, 
                 from_network, 
+                from_builder,
                 from_hashes,
                 to_network
             );
