@@ -40,6 +40,7 @@ use reth_provider::{
 };
 use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -982,6 +983,7 @@ pub struct MevWorkWorker<Provider, Pool> {
     bid_simulate_req_rx: mpsc::UnboundedReceiver<BidRuntime<Pool, BscEvmConfig>>,
     bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<Pool, BscEvmConfig>>,
     provider: Provider,
+    mev_running: Arc<AtomicBool>,
 }
 
 impl<Provider, Pool> MevWorkWorker<Provider, Pool>
@@ -999,11 +1001,24 @@ where
     pub fn new(simulator: Arc<BidSimulator<Provider, Pool>>, provider: Provider) -> Self {
         let (bid_simulate_req_tx, bid_simulate_req_rx) =
             mpsc::unbounded_channel::<BidRuntime<Pool, BscEvmConfig>>();
-        Self { simulator, bid_simulate_req_rx, bid_simulate_req_tx, provider }
+        Self {
+            simulator,
+            bid_simulate_req_rx,
+            bid_simulate_req_tx,
+            provider,
+            mev_running: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub async fn run(mut self) {
         info!("Starting MevWorkWorker");
+        self.mev_running.store(true, Ordering::Relaxed);
+
+        // Set global MEV running status
+        if let Err(e) = crate::shared::set_mev_running(self.mev_running.clone()) {
+            warn!("MEV running status already set: {:?}", e);
+        }
+
         let mut send_bid_interval = tokio::time::interval(Duration::from_millis(20));
         let mut clear_bid_interval = tokio::time::interval(Duration::from_millis(1000));
 
@@ -1139,6 +1154,8 @@ where
             parlia.clone(),
             validator_address,
             snapshot_provider.clone(),
+            mining_config.validator_commission.unwrap_or(100),
+            mining_config.greedy_merge,
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,

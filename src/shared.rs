@@ -12,6 +12,7 @@ use reth_payload_builder_primitives::Events;
 use reth_provider::{BlockNumReader, HeaderProvider};
 use schnellru::{ByLength, LruMap};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -65,6 +66,8 @@ static PAYLOAD_EVENTS_TX: OnceLock<broadcast::Sender<Events<BscPayloadTypes>>> =
 /// Broadcast channel for notifying about successfully imported block hashes
 static IMPORTED_BLOCKS_TX: OnceLock<broadcast::Sender<B256>> = OnceLock::new();
 
+/// Global MEV running status
+static MEV_RUNNING: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 /// Global proxyed peer IDs list
 static PROXYED_PEER_IDS: OnceLock<Vec<PeerId>> = OnceLock::new();
 
@@ -492,6 +495,18 @@ pub fn clear_body_cache() {
     if let Ok(mut guard) = cache.write() {
         *guard = BodyCache::default();
     }
+}
+
+// ============ MEV Running Status ============
+
+/// Set global MEV running status (called by MevWorkWorker on startup)
+pub fn set_mev_running(running: Arc<AtomicBool>) -> Result<(), Arc<AtomicBool>> {
+    MEV_RUNNING.set(running)
+}
+
+/// Get global MEV running status
+pub fn is_mev_running() -> bool {
+    MEV_RUNNING.get().map(|status| status.load(Ordering::Relaxed)).unwrap_or(false)
 }
 
 #[cfg(test)]

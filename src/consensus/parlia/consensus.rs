@@ -776,7 +776,11 @@ where
             std::collections::HashMap::new();
         for vote in votes.iter() {
             // Only keep votes from validators in parent snapshot
-            if target_header_parent_snap.validators_map.values().any(|vi| vi.vote_addr == vote.vote_address) {
+            if target_header_parent_snap
+                .validators_map
+                .values()
+                .any(|vi| vi.vote_addr == vote.vote_address)
+            {
                 // If the same address appears multiple times, keep the first one (stable and deterministic)
                 unique_by_addr.entry(vote.vote_address).or_insert(vote.signature);
             } else {
