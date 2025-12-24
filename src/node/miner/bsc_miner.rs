@@ -912,6 +912,35 @@ where
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
 
+        // Calculate and record block broadcast delay
+        // This is the time from block timestamp to current broadcast time, in nanoseconds
+        let block_timestamp = sealed_block.header().timestamp;
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+
+        // Convert block timestamp (seconds) to nanoseconds
+        let block_timestamp_nanos = block_timestamp as u128 * 1_000_000_000;
+        // Get current time in nanoseconds
+        let now_nanos = now.as_nanos();
+
+        // Calculate delay in nanoseconds (broadcast_time - block_timestamp)
+        let broadcast_delay_nanos = if now_nanos >= block_timestamp_nanos {
+            (now_nanos - block_timestamp_nanos) as f64
+        } else {
+            // In case of clock skew, record as 0
+            0.0
+        };
+
+        MINER_METRICS.block_broadcast_delay_seconds.record(broadcast_delay_nanos);
+
+        debug!(
+            target: "bsc::miner",
+            block_number,
+            block_timestamp,
+            broadcast_delay_nanos,
+            "Block broadcast delay recorded"
+        );
+
         // TODO: wait more times when huge chain import.
         // TODO: only canonical head can broadcast, avoid sidechain blocks.
         let parent_number = block_number.saturating_sub(1);
@@ -1089,8 +1118,11 @@ where
         task_executor: TaskExecutor,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         mining_config.validate()?;
-        let validator_address = mining_config.validator_address.ok_or(eyre::eyre!("No validator address configured"))?;
-        let signing_key = mining_config.signing_key.clone().ok_or(eyre::eyre!("No signing key configured"))?;
+        let validator_address = mining_config
+            .validator_address
+            .ok_or(eyre::eyre!("No validator address configured"))?;
+        let signing_key =
+            mining_config.signing_key.clone().ok_or(eyre::eyre!("No signing key configured"))?;
 
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
