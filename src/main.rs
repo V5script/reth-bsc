@@ -1,13 +1,19 @@
 use clap::{Args, Parser};
-use reth::{builder::NodeHandle, cli::Cli};
-use reth_bsc::node::consensus::BscConsensus;
-use reth_bsc::{
-    chainspec::{parser::BscChainSpecParser, genesis_override},
-    node::{evm::config::BscEvmConfig, BscNode},
+use reth::{
+    builder::NodeHandle,
+    cli::Cli,
+    consensus::FullConsensus,
+    version::{default_reth_version_metadata, try_init_version_metadata},
 };
 use reth_bsc::consensus::parlia::bls_signer;
-use std::sync::Arc;
+use reth_bsc::node::consensus::BscConsensus;
+use reth_bsc::{
+    chainspec::{genesis_override, parser::BscChainSpecParser},
+    node::{evm::config::BscEvmConfig, BscNode},
+    BscPrimitives,
+};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -33,6 +39,19 @@ pub struct BscCliArgs {
     /// Minimum gas tip for mined blocks (e.g., 1000000000 for 1G, 1000000000000 for 1T)
     #[arg(long = "mining.min-gas-tip")]
     pub mining_min_gas_tip: Option<u128>,
+
+    /// Use reth 2.0 sparse-trie background task for state-root computation in
+    /// payload build (opt-in).
+    ///
+    /// Env alternative: `BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT=true`.
+    #[arg(long = "mining.use-sparse-trie-state-root")]
+    pub mining_use_sparse_trie_state_root: bool,
+
+    /// Accept BEP-675 builder-proposed blocks via `mev_sendBidBlock`.
+    ///
+    /// Env alternative: `BSC_MINING_BID_BLOCK_ENABLED=true`.
+    #[arg(long = "mining.bid-block-enabled")]
+    pub mining_bid_block_enabled: bool,
 
     /// Private key for mining (hex format, for testing only)
     /// The validator address will be automatically derived from this key
@@ -107,7 +126,68 @@ pub struct BscCliArgs {
     pub evn_disable_tx_broadcast_forbidden: bool,
 }
 
+/// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
+///
+/// BSC blocks carry many legitimate zero-gas-price transactions, most of them not sent
+/// by the block's coinbase, so with upstream's default threshold of 0 they dominate the
+/// gas-price-oracle sample and `eth_gasPrice` / `eth_maxPriorityFeePerGas` return 0.
+const BSC_DEFAULT_GPO_IGNORE_PRICE: u64 = 2;
+
+/// Returns true if `--gpo.ignoreprice` was passed explicitly, either as
+/// `--gpo.ignoreprice <value>` or `--gpo.ignoreprice=<value>`.
+fn user_set_gpo_ignore_price(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|arg| arg == "--gpo.ignoreprice" || arg.starts_with("--gpo.ignoreprice="))
+}
+
 fn main() -> eyre::Result<()> {
+    // Override reth's global version metadata so startup/P2P logs identify
+    // this binary as Reth-BSC with its own version + commit.
+    {
+        use std::borrow::Cow;
+        // The BSC release identifier (e.g. `0.1.0-fix`), derived from the nearest
+        // git tag in build.rs. This is what distinguishes patch/fix releases that
+        // share a Cargo package version.
+        let bsc_version = env!("RETH_BSC_VERSION");
+        let git_sha_short = env!("RETH_BSC_GIT_SHA");
+        let git_sha_long = env!("RETH_BSC_GIT_SHA_LONG");
+
+        let mut md = default_reth_version_metadata();
+        // Capture the upstream Reth identity before we overwrite these fields, so
+        // both the BSC and upstream builds can be reported in `reth --version`.
+        let upstream_reth_version = md.cargo_pkg_version.clone();
+        let upstream_reth_sha = md.vergen_git_sha_long.clone();
+        let build_timestamp = md.vergen_build_timestamp.clone();
+        let cargo_features = md.vergen_cargo_features.clone();
+        let build_profile = md.build_profile_name.clone();
+
+        md.name_client = Cow::Borrowed("Reth-BSC");
+        // Expose the BSC release id as the primary version. This flows into the
+        // `reth_info{version=...}` metric and the DB client version, so `0.1.0-fix`
+        // is distinguishable from `0.1.0` without a commit-to-tag lookup.
+        md.cargo_pkg_version = Cow::Borrowed(bsc_version);
+        md.vergen_git_sha = Cow::Borrowed(git_sha_short);
+        md.vergen_git_sha_long = Cow::Borrowed(git_sha_long);
+        md.short_version = Cow::Owned(format!("{bsc_version} ({git_sha_short})"));
+        // Report both the BSC release/commit and the upstream Reth version/commit
+        // that this binary was built against.
+        // Note: the CLI prepends the client name ("Reth-BSC") to the first line,
+        // so line 0 is just "Version: ..." to render as "Reth-BSC Version: ...".
+        md.long_version = Cow::Owned(format!(
+            "Version: {bsc_version}\n\
+             Commit SHA: {git_sha_long}\n\
+             Upstream Reth Version: {upstream_reth_version}\n\
+             Upstream Reth Commit SHA: {upstream_reth_sha}\n\
+             Build Timestamp: {build_timestamp}\n\
+             Build Features: {cargo_features}\n\
+             Build Profile: {build_profile}",
+        ));
+        md.p2p_client_version = Cow::Owned(format!(
+            "reth-bsc/v{bsc_version}-{git_sha_short}/{}",
+            std::env::consts::OS,
+        ));
+        let _ = try_init_version_metadata(md);
+    }
+
     reth_cli_util::sigsegv_handler::install();
 
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.
@@ -119,8 +199,14 @@ fn main() -> eyre::Result<()> {
     reth_bsc::shared::init_bid_package_queue();
 
     Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
-        |spec| (BscEvmConfig::new(spec.clone()), BscConsensus::new(spec)),
-        async move |builder, args| {
+        |spec| {
+            (
+                BscEvmConfig::new(spec.clone()),
+                Arc::new(BscConsensus::new(spec))
+                    as Arc<dyn FullConsensus<BscPrimitives>>,
+            )
+        },
+        async move |mut builder, args| {
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
@@ -131,7 +217,13 @@ fn main() -> eyre::Result<()> {
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
             let ipc_path = builder.config().rpc.ipcpath.clone();
-            
+
+            // Apply the BSC gas-price-oracle default unless the user set the flag.
+            if !user_set_gpo_ignore_price(std::env::args()) {
+                builder.config_mut().rpc.gas_price_oracle.ignore_price =
+                    BSC_DEFAULT_GPO_IGNORE_PRICE;
+            }
+
             // Map CLI args into a global MiningConfig override before launching services
             {
                 use reth_bsc::node::miner::{config as mining_config, MiningConfig};
@@ -182,6 +274,16 @@ fn main() -> eyre::Result<()> {
 
                 if let Some(min_gas_tip) = args.mining_min_gas_tip {
                     mining_config.min_gas_tip = Some(min_gas_tip);
+                }
+
+                // CLI takes precedence over env BSC_MINING_USE_SPARSE_TRIE_STATE_ROOT.
+                if args.mining_use_sparse_trie_state_root {
+                    mining_config.use_sparse_trie_state_root = true;
+                }
+
+                // CLI takes precedence over env BSC_MINING_BID_BLOCK_ENABLED.
+                if args.mining_bid_block_enabled {
+                    mining_config.bid_block_enabled = true;
                 }
 
                 // Ensure keys are available if enabled but none provided
@@ -328,6 +430,17 @@ fn main() -> eyre::Result<()> {
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
+                        // Every BSC namespace below is registered with `merge_if_module_configured`
+                        // rather than `merge_configured`: the latter merges into every configured
+                        // transport regardless of `--http.api`/`--ws.api`, so operator namespace
+                        // selection was silently ignored for the BSC-specific APIs. That left
+                        // `admin_setBidBlockPermission`, `miner_stop`, `miner_setGasLimit`,
+                        // `miner_setEtherbase` and `mev_addBuilder`/`removeBuilder` callable
+                        // unauthenticated on any node with HTTP enabled, even when the operator had
+                        // excluded those namespaces — geth honours the equivalent `HTTPModules`
+                        // setting, so this was also a parity gap.
+                        use reth_rpc_server_types::RethRpcModule;
+
                         tracing::info!("Start to register Parlia RPC API...");
                         use reth_bsc::rpc::parlia::{ParliaApiImpl, ParliaApiServer, DynSnapshotProvider};
                         
@@ -340,6 +453,14 @@ fn main() -> eyre::Result<()> {
                         
                         let wrapped_provider = Arc::new(DynSnapshotProvider::new(snapshot_provider));
                         let parlia_api = ParliaApiImpl::new(wrapped_provider, ctx.provider().clone());
+                        // `parlia` stays unconditional: reth's CLI rejects module names outside its
+                        // known set ("Invalid RPC module 'parlia' in http.api"), so gating it on
+                        // `RethRpcModule::Other("parlia")` would make the namespace unreachable —
+                        // an operator has no way to ask for it back. That is acceptable here and
+                        // only here, because every `parlia_*` method is read-only (snapshot,
+                        // validator and justified/finalized queries, plus two calldata encoders);
+                        // none mutates node state. The namespaces that do — admin, miner, mev —
+                        // are gated below.
                         ctx.modules.merge_configured(parlia_api.into_rpc())?;
                         tracing::info!("Succeed to register Parlia RPC API");
 
@@ -357,8 +478,36 @@ fn main() -> eyre::Result<()> {
                         // Get chain spec from context
                         let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
                         let mev_api = MevApiImpl::new(snapshot_provider, chain_spec);
-                        ctx.modules.merge_configured(mev_api.into_rpc())?;
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Mev, mev_api.into_rpc())?;
                         tracing::info!("Succeed to register MEV RPC API");
+
+                        tracing::info!("Start to register Miner RPC API...");
+                        use reth_bsc::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
+
+                        // Remove reth's built-in MinerApi methods (registered on IPC by default)
+                        // to avoid conflicts with our BscMinerApi which redefines them
+                        ctx.modules.remove_method_from_configured("miner_setExtra");
+                        ctx.modules.remove_method_from_configured("miner_setGasPrice");
+                        ctx.modules.remove_method_from_configured("miner_setGasLimit");
+                        let miner_api = BscMinerApiImpl::new();
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
+                        tracing::info!("Succeed to register Miner RPC API");
+
+                        tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health)...");
+                        use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
+
+                        // Remove the default unimplemented eth_coinbase before registering our version
+                        ctx.modules.remove_method_from_configured("eth_coinbase");
+                        let eth_ext_api = BscEthExtApiImpl::new();
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Eth extension API");
+
+                        tracing::info!("Start to register BSC Admin RPC API (admin_setBidBlockPermission)...");
+                        use reth_bsc::rpc::admin::{BscAdminApiImpl, BscAdminApiServer};
+
+                        let admin_api = BscAdminApiImpl::new();
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Admin, admin_api.into_rpc())?;
+                        tracing::info!("Succeed to register BSC Admin RPC API");
 
                         tracing::info!("Start to register Blob RPC API...");
                         use reth_bsc::rpc::blob::{BlobApiImpl, BlobApiServer};
@@ -366,16 +515,47 @@ fn main() -> eyre::Result<()> {
                         // Get pool and provider from context
                         let pool = ctx.pool().clone();
                         let provider = ctx.provider().clone();
-                        
+
                         let blob_api = BlobApiImpl::new(pool, provider);
-                        ctx.modules.merge_configured(blob_api.into_rpc())?;
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, blob_api.into_rpc())?;
                         tracing::info!("Succeed to register Blob RPC API");
+
+                        // Debug-only builder extraction seam for BEP-675 e2e testing
+                        // (bep675 testing plan, Tier 2). Off unless explicitly enabled.
+                        if std::env::var("BSC_DEBUG_BUILDER").map(|v| v == "true").unwrap_or(false) {
+                            tracing::info!("Start to register Debug Builder RPC API (debug_buildCandidateBlock)...");
+                            use reth_bsc::rpc::debug_builder::{BscDebugBuilderApiServer, DebugBuilderApiImpl};
+                            let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
+                            let debug_builder_api = DebugBuilderApiImpl::new(ctx.provider().clone(), chain_spec);
+                            ctx.modules.merge_if_module_configured(RethRpcModule::Debug, debug_builder_api.into_rpc())?;
+                            tracing::info!("Succeed to register Debug Builder RPC API");
+                        }
+
+                        tracing::info!("Start to register eth_config (EIP-7910) API...");
+                        use reth::api::FullNodeComponents;
+                        use reth_bsc::rpc::{BscEthConfigApiServer, BscEthConfigHandler};
+
+                        let eth_config = BscEthConfigHandler::new(
+                            ctx.provider().clone(),
+                            ctx.node().evm_config().clone(),
+                        );
+                        ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
+                        tracing::info!("Succeed to register eth_config (EIP-7910) API");
                         Ok(())
                     })
                     .launch().await?;
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
+            reth_bsc::shared::set_engine_api_tx(node.engine_api_tx.clone().unwrap()).unwrap();
+            tracing::debug!("set engine api tx successfully");
+
+            // Publish CanonicalInMemoryState so the sparse-trie spawner can resolve
+            // in-memory parents back to the on-disk anchor. Concrete `BlockchainProvider`
+            // is only reachable here (post-launch); the generic builder context isn't.
+            let _ = reth_bsc::shared::set_canonical_in_memory_state(
+                node.provider.canonical_in_memory_state(),
+            );
 
             // Set the IPC client
             reth_bsc::shared::set_ipc_client(ipc_path).await.unwrap();
@@ -384,4 +564,21 @@ fn main() -> eyre::Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_set_gpo_ignore_price;
+
+    fn args(v: &[&str]) -> std::vec::IntoIter<String> {
+        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn detects_explicit_gpo_ignore_price() {
+        assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice", "0"])));
+        assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice=7"])));
+        assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--chain", "bsc"])));
+        assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.blocks", "20"])));
+    }
 }

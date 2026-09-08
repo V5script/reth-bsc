@@ -2,7 +2,7 @@ use crate::node::miner::bid_simulator::{BidRuntime, BidSimulator};
 use crate::node::miner::payload::BscBuildArguments;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, vote_pool, Parlia},
+    consensus::parlia::{provider::SnapshotProvider, Parlia},
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -25,7 +25,6 @@ use crate::{
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
 use k256::ecdsa::SigningKey;
-use lru::LruCache;
 use reth::transaction_pool::PoolTransaction;
 use reth::transaction_pool::TransactionPool;
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
@@ -33,7 +32,8 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_network::message::NewBlockMessage;
 use reth_payload_primitives::BuiltPayload;
-use reth_primitives::{SealedHeader, TransactionSigned};
+use reth_primitives_traits::SealedHeader;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::BlockBody;
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
@@ -42,24 +42,23 @@ use reth_revm::cancelled::ManualCancel;
 use reth_tasks::TaskExecutor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, trace, warn};
 
-/// Maximum number of recently mined blocks to track for double signing prevention
-const RECENT_MINED_BLOCKS_CACHE_SIZE: usize = 100;
-
 #[derive(Clone, Debug)]
 pub struct MiningContext {
-    pub header: Option<reth_primitives::Header>, // tmp header for payload building.
-    pub parent_header: reth_primitives::SealedHeader,
+    pub header: Option<alloy_consensus::Header>, // tmp header for payload building.
+    pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
     pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`.
+    pub block_timestamp_ms: u64,
+    /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
+    pub end_mining_timestamp_ms: u128,
 }
 
 #[derive(Clone)]
@@ -77,6 +76,34 @@ pub struct NewWorkWorker<Provider> {
     mining_queue_tx: mpsc::UnboundedSender<MiningContext>,
     consensus: Arc<Parlia<BscChainSpec>>,
     pre_cached: Option<PrecachedState>,
+    /// Hash of the tip block for which mining was last triggered, used to suppress
+    /// periodic-tick retries when no new canonical head has arrived.
+    last_triggered_tip: Option<alloy_primitives::B256>,
+}
+
+/// Skip mining when isolated (no peers or network handle not yet installed) to avoid
+/// producing a small fork-chain that peers do not know about after reconnect.
+fn is_network_ready_to_mine(tip_number: u64) -> bool {
+    let Some(network) = crate::shared::get_network_handle() else {
+        debug!(
+            target: "bsc::miner",
+            tip_number,
+            "Skip mining due to network handle not yet available"
+        );
+        return false;
+    };
+
+    use reth_network::PeersInfo;
+    if network.num_connected_peers() == 0 {
+        debug!(
+            target: "bsc::miner",
+            tip_number,
+            "Skip mining due to no peers connected"
+        );
+        return false;
+    }
+
+    true
 }
 
 impl<Provider> NewWorkWorker<Provider>
@@ -105,21 +132,59 @@ where
             mining_queue_tx,
             consensus,
             pre_cached: None,
+            last_triggered_tip: None,
         }
     }
 
     pub async fn run(mut self) {
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
 
-        if let Some(tip_header) = self.get_tip_header_at_startup() {
+        let mut notifications = self.provider.canonical_state_stream();
+        debug!(target: "bsc::miner", "Subscribed to canonical_state_stream");
+
+        // Don't block the canonical notifications loop on potentially slow startup checks (DB
+        // reads / snapshot locks). If this blocks, we can miss the first few canonical commits and
+        // never emit the per-commit "Try new work" log.
+        let startup_tip = self.get_tip_header_at_startup();
+        if let Some(ref tip_header) = startup_tip {
             debug!("Try new work at startup, tip_block={}", tip_header.number());
-            self.try_new_work(&tip_header).await;
+            let validator_address = self.validator_address;
+            let provider = self.provider.clone();
+            let snapshot_provider = Arc::clone(&self.snapshot_provider);
+            let mining_queue_tx = self.mining_queue_tx.clone();
+            let consensus = Arc::clone(&self.consensus);
+            let tip_header = tip_header.clone();
+            tokio::spawn(async move {
+                let worker = NewWorkWorker::new(
+                    validator_address,
+                    provider,
+                    snapshot_provider,
+                    mining_queue_tx,
+                    consensus,
+                );
+                worker.try_new_work(&tip_header).await;
+            });
         }
 
-        let mut notifications = self.provider.canonical_state_stream();
+        // Periodic ticker: retries try_new_work when no canonical events arrive.
+        // This is essential for deadlock recovery when all validators restart simultaneously
+        // and the sync gate times out — without this ticker, try_new_work would never be
+        // re-invoked after the startup attempt.
+        let mut periodic_tick =
+            tokio::time::interval(Duration::from_secs(3));
+        periodic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Burn the first immediate tick so we don't double-fire with the startup spawn above.
+        periodic_tick.tick().await;
+
         loop {
-            match notifications.next().await {
-                Some(event) => {
+            tokio::select! {
+            biased; // prefer canonical events over the ticker
+            notification = notifications.next() => {
+            let Some(event) = notification else {
+                warn!("Canonical state notification stream ended, exiting...");
+                break;
+            };
+            let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
@@ -178,16 +243,12 @@ where
                     }
 
                     let tip_header = tip.clone_sealed_header();
-                    // Prune old votes from the vote pool based on the new block number
-                    let block_number =
-                        self.provider.last_block_number().ok().unwrap_or(tip_header.number());
-                    vote_pool::prune(block_number);
 
                     // Produce and broadcast a local vote for this new canonical head, if eligible
                     if let Some(sp) = crate::shared::get_snapshot_provider() {
                         let sp = Arc::clone(sp);
                         let spec = self.consensus.spec.clone();
-                        match self.provider.header(&tip_header.hash()) {
+                        match self.provider.header(tip_header.hash()) {
                             Ok(Some(h)) => {
                                 tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
                                 tokio::spawn(async move {
@@ -198,24 +259,59 @@ where
                                     );
                                 });
                             }
+                            Ok(None) => {
+                                if let Some(h) = crate::node::evm::util::get_header_by_hash_from_cache(&tip_header.hash()) {
+                                    tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block from cache, validator: {}, tip: {}", self.validator_address, tip_header.number());
+                                    tokio::spawn(async move {
+                                        crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
+                                            spec,
+                                            sp.as_ref(),
+                                            &h,
+                                        );
+                                    });
+                                } else {
+                                    tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
+                                }
+                            }
                             Err(e) => {
                                 tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}, due to {}", self.validator_address, tip_header.number(), e);
-                            }
-                            _ => {
-                                tracing::error!(target: "bsc::vote", "Failed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
                             }
                         }
                     }
 
                     self.cache_for_next(&committed);
 
+                    self.last_triggered_tip = Some(tip_header.hash());
                     self.try_new_work(&tip_header).await;
                 }
-                None => {
-                    warn!("Canonical state notification stream ended, exiting...");
-                    break;
+            _ = periodic_tick.tick() => {
+                // Periodic retry: fires when no canonical events have arrived recently.
+                // Critical for breaking the all-validators-restart deadlock: once the
+                // sync gate timeout elapses, this ticker drives try_new_work to actually
+                // attempt mining.
+                if let Some(tip) = self.get_tip_header_at_startup() {
+                    if self.last_triggered_tip == Some(tip.hash()) {
+                        // A canonical event already triggered mining for this tip.
+                        // But if no new canonical events are arriving (all-validators-restart
+                        // deadlock), we must keep retrying via the ticker. Clear the guard
+                        // so the next tick fires even if the tip hasn't changed.
+                        self.last_triggered_tip = None;
+                        continue;
+                    }
+                    debug!(
+                        target: "bsc::miner",
+                        tip_number = tip.number(),
+                        "Periodic sync-gate retry"
+                    );
+                    self.last_triggered_tip = Some(tip.hash());
+                    self.try_new_work(&tip).await;
+                    // Clear so the next tick retries if try_new_work was skipped (e.g.
+                    // backfill still active). If a canonical event fires before the next
+                    // tick it will set last_triggered_tip again, preventing a duplicate.
+                    self.last_triggered_tip = None;
                 }
             }
+            } // end tokio::select!
         }
     }
 
@@ -300,7 +396,7 @@ where
         }
     }
 
-    fn get_tip_header_at_startup(&self) -> Option<reth_primitives::SealedHeader> {
+    fn get_tip_header_at_startup(&self) -> Option<reth_primitives_traits::SealedHeader> {
         let best_number = self.provider.best_block_number().ok()?;
         let tip_header = self.provider.sealed_header(best_number).ok()??;
         Some(tip_header)
@@ -345,15 +441,13 @@ where
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
-        // TODO: refine check is_syncing status.
-        if tip.timestamp()
-            < SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() - 3
-        {
-            debug!(
-                "Skip to mine new block due to maybe in syncing, validator: {}, tip: {}",
-                self.validator_address,
-                tip.number()
-            );
+        // Check if mining is disabled via miner_stop RPC
+        if !crate::shared::is_mining_enabled() {
+            debug!("Skip mining: mining is disabled via miner_stop RPC");
+            return;
+        }
+
+        if !is_network_ready_to_mine(tip.number()) {
             return;
         }
 
@@ -436,6 +530,8 @@ where
             parent_snapshot: Arc::new(parent_snapshot),
             is_inturn,
             cached_reads: self.maybe_pre_cached(parent_hash),
+            block_timestamp_ms: 0,
+            end_mining_timestamp_ms: 0,
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
@@ -456,7 +552,8 @@ pub struct MainWorkWorker<Pool, Provider> {
     mining_queue_rx: mpsc::UnboundedReceiver<MiningContext>,
     payload_tx: mpsc::UnboundedSender<SubmitContext>,
     running_job_handle: Option<BscPayloadJobHandle>,
-    payload_job_join_set: JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    payload_job_join_set:
+        JoinSet<Result<(), Box<crate::node::miner::payload::BscPayloadJobError>>>,
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
     desired_gas_limit: u64,
     desired_min_gas_tip: u128,
@@ -603,22 +700,37 @@ where
             self.validator_address,
         );
 
+        // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
+        let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
+
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
             self.provider.clone(),
             self.pool.clone(),
             evm_config,
-            EthereumBuilderConfig::new().with_gas_limit(self.desired_gas_limit),
+            EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             self.chain_spec.clone(),
             self.parlia.clone(),
             mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
-            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes),
+            config: PayloadConfig::new(Arc::new(mining_ctx.parent_header.clone()), attributes, alloy_rpc_types_engine::PayloadId::new([0u8; 8])),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: self.desired_min_gas_tip,
+            min_gas_tip: crate::shared::get_miner_gas_tip()
+                .map(|v| v as u128)
+                .unwrap_or(self.desired_min_gas_tip),
+            // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
+            // and the engine has registered a spawner. Falls back to legacy path when None.
+            state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            // R2: bound the sparse-trie state_root() wait to this slot so an in-turn
+            // block never blocks past its deadline (then falls back to sync root).
+            state_root_deadline_ms: Some(
+                (mining_ctx.end_mining_timestamp_ms as u64)
+                    .saturating_sub(crate::node::miner::payload::STATE_ROOT_WAIT_MARGIN_MS),
+            ),
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
@@ -658,25 +770,20 @@ where
     }
 }
 
-/// Worker responsible for submitting the seal block to engine-tree and other peers.
+/// Worker responsible for submitting the sealed block to engine-tree and other peers.
+///
+/// Delay scheduling (out-of-turn back-off) is handled upstream in [`BscPayloadJob`], so
+/// every [`SubmitContext`] that arrives here is already ready to be submitted immediately.
 pub struct ResultWorkWorker<Provider> {
     /// Validator address
     validator_address: Address,
     /// Provider for blockchain data
     provider: Provider,
-    /// Parlia consensus engine
-    parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
-    /// Receiver for built payloads
+    /// Receiver for payloads that are ready to submit (delay already applied by payload job)
     payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
-    /// Receiver for delayed payloads
-    delay_submit_rx: mpsc::UnboundedReceiver<BscBuiltPayload>,
-    /// Sender for delayed payloads
-    delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-    /// LRU cache to track recently mined blocks to prevent double signing
-    recent_mined_blocks: Arc<Mutex<LruCache<u64, Vec<alloy_primitives::B256>>>>,
-    /// Consensus metrics for tracking double signs and delays
+    /// Consensus metrics for tracking double signs and block turn stats
     consensus_metrics: BscConsensusMetrics,
-    // flag for submitting built payload
+    /// Flag for submitting built payload
     submit_built_payload: bool,
 }
 
@@ -684,44 +791,21 @@ impl<Provider> ResultWorkWorker<Provider>
 where
     Provider: HeaderProvider + BlockNumReader + Send + Sync + Clone + 'static,
 {
-    /// Creates a new ResultWorkWorker instance
+    /// Creates a new ResultWorkWorker instance.
     pub fn new(
         validator_address: Address,
         provider: Provider,
-        parlia: Arc<crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>>,
         payload_rx: mpsc::UnboundedReceiver<SubmitContext>,
         submit_built_payload: bool,
     ) -> Self {
-        let (delay_submit_tx, delay_submit_rx) = mpsc::unbounded_channel::<BscBuiltPayload>();
-        let recent_mined_blocks = Arc::new(Mutex::new(LruCache::new(
-            std::num::NonZeroUsize::new(RECENT_MINED_BLOCKS_CACHE_SIZE).unwrap(),
-        )));
         tracing::info!("ResultWorkWorker created, submit_built_payload: {}", submit_built_payload);
         Self {
             validator_address,
             provider,
-            parlia,
             payload_rx,
-            delay_submit_tx,
-            delay_submit_rx,
-            recent_mined_blocks,
             consensus_metrics: BscConsensusMetrics::default(),
             submit_built_payload,
         }
-    }
-
-    /// Create and start a delay submit task
-    fn start_delay_task(
-        payload: BscBuiltPayload,
-        delay_ms: u64,
-        delay_submit_tx: mpsc::UnboundedSender<BscBuiltPayload>,
-    ) {
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-            if let Err(e) = delay_submit_tx.send(payload) {
-                error!("Failed to send delayed payload to channel: {}", e);
-            }
-        });
     }
 
     /// Run the result worker to process and submit payloads
@@ -729,106 +813,39 @@ where
         info!("Starting ResultWorkWorker for validator: {}", self.validator_address);
 
         loop {
-            tokio::select! {
-                submit_ctx = self.payload_rx.recv() => {
-                    match submit_ctx {
-                        Some(submit_ctx) => {
-                            let payload = submit_ctx.payload;
-                            let block_number = payload.block().number();
-                            let block_hash = payload.block().hash();
-                            let delay_ms = self.parlia.delay_for_ramanujan_fork(&submit_ctx.mining_ctx.parent_snapshot, payload.block().header());
-                            debug!(
+            match self.payload_rx.recv().await {
+                Some(submit_ctx) => {
+                    let is_inturn = submit_ctx.mining_ctx.is_inturn;
+                    let block_number = submit_ctx.payload.block().number();
+                    let block_hash = submit_ctx.payload.block().hash();
+                    match self.submit_payload(submit_ctx.payload).await {
+                        Ok(()) => {
+                            info!(
                                 target: "bsc::miner",
-                                block_number = block_number,
+                                block_number,
                                 block_hash = %block_hash,
-                                is_inturn = submit_ctx.mining_ctx.is_inturn,
-                                delay_ms = delay_ms,
-                                "Check submit delay"
+                                is_inturn,
+                                "Succeed to submit block"
                             );
-                            if delay_ms == 0 {
-                                match self.submit_payload(payload).await {
-                                    Ok(()) => {
-                                        info!(
-                                            target: "bsc::miner",
-                                            block_number = block_number,
-                                            block_hash = %block_hash,
-                                            is_inturn = submit_ctx.mining_ctx.is_inturn,
-                                            "Succeed to submit block"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            target: "bsc::miner",
-                                            block_number = block_number,
-                                            block_hash = %block_hash,
-                                            is_inturn = submit_ctx.mining_ctx.is_inturn,
-                                            error = %e,
-                                            "Failed to submit block"
-                                        );
-                                    }
-                                }
-                            } else {
-                                // Update intentional mining delay metric
-                                self.consensus_metrics.intentional_mining_delays_total.increment(1);
-
-                                Self::start_delay_task(
-                                    payload,
-                                    delay_ms,
-                                    self.delay_submit_tx.clone(),
-                                );
-                                info!(
-                                    target: "bsc::miner",
-                                    block_number = block_number,
-                                    block_hash = %block_hash,
-                                    is_inturn = submit_ctx.mining_ctx.is_inturn,
-                                    delay_ms = delay_ms,
-                                    "Block scheduled for delayed submission"
-                                );
-                            }
                         }
-                        None => {
-                            warn!(
+                        Err(e) => {
+                            error!(
                                 target: "bsc::miner",
-                                "Main payload channel closed, stopping ResultWorkWorker"
+                                block_number,
+                                block_hash = %block_hash,
+                                is_inturn,
+                                error = %e,
+                                "Failed to submit block"
                             );
-                            break;
                         }
                     }
                 }
-
-                delayed_payload = self.delay_submit_rx.recv() => {
-                    match delayed_payload {
-                        Some(payload) => {
-                            let block_number = payload.block().number();
-                            let block_hash = payload.block().hash();
-                            match self.submit_payload(payload).await {
-                                Ok(()) => {
-                                    info!(
-                                        target: "bsc::miner",
-                                        block_number = block_number,
-                                        block_hash = %block_hash,
-                                        "Succeed to submit delayed block"
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(
-                                        target: "bsc::miner",
-                                        block_number = block_number,
-                                        block_hash = %block_hash,
-                                        error = %e,
-                                        "Failed to submit delayed block"
-                                    );
-                                }
-                            }
-                        }
-                        None => {
-                            warn!(
-                                target: "bsc::miner",
-                                "Delay payload channel closed, stopping ResultWorkWorker"
-                            );
-                            break;
-                        }
-                    }
+                None => {
+                    warn!(
+                        target: "bsc::miner",
+                        "Main payload channel closed, stopping ResultWorkWorker"
+                    );
+                    break;
                 }
             }
         }
@@ -856,30 +873,61 @@ where
             return Ok(());
         }
 
-        {
-            // check double sign
-            let mut cache = self.recent_mined_blocks.lock().unwrap();
-            if let Some(prev_parents) = cache.get(&block_number) {
-                let mut double_sign = false;
-                for prev_parent in prev_parents {
-                    if *prev_parent == parent_hash {
-                        error!("Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}", 
-                            block_number, block_hash, sealed_block.header().state_root, parent_hash);
-                        // Update double sign metric
-                        self.consensus_metrics.double_signs_detected_total.increment(1);
-                        double_sign = true;
-                        break;
-                    }
-                }
-                if double_sign {
+        // Check if parent is still canonical (handles reorg during delayed submission)
+        let parent_number = block_number.saturating_sub(1);
+        match self.provider.sealed_header(parent_number) {
+            Ok(Some(canonical_parent)) => {
+                if canonical_parent.hash() != parent_hash {
+                    debug!(
+                        target: "bsc::miner",
+                        block_number,
+                        parent_number,
+                        expected_parent_hash = %parent_hash,
+                        canonical_parent_hash = %canonical_parent.hash(),
+                        "Skip to submit block due to parent no longer canonical (reorg occurred)"
+                    );
                     return Ok(());
                 }
-                let mut updated_parents = prev_parents.clone();
-                updated_parents.push(parent_hash);
-                cache.put(block_number, updated_parents);
-            } else {
-                cache.put(block_number, vec![parent_hash]);
             }
+            Ok(None) => {
+                // Parent header not found - likely reorged away
+                debug!(
+                    target: "bsc::miner",
+                    block_number,
+                    parent_number,
+                    parent_hash = %parent_hash,
+                    "Skip to submit block due to parent not found in canonical chain"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Provider/DB error - log warning and skip to avoid potential issues
+                warn!(
+                    target: "bsc::miner",
+                    block_number,
+                    parent_number,
+                    error = %e,
+                    "Failed to query canonical parent header, skipping block submission"
+                );
+                return Ok(());
+            }
+        }
+
+        // Check double sign via the cache shared with the BidBlock path (`try_submit_winning_bid_block`
+        // in payload.rs) — a validator must not sign two different blocks at the same height on the
+        // same parent, regardless of which path produced either one.
+        if !crate::shared::check_and_record_mined_block(block_number, parent_hash) {
+            error!(
+                "Reject Double Sign!! block: {}, hash: 0x{:x}, root: 0x{:x}, ParentHash: 0x{:x}",
+                block_number,
+                block_hash,
+                sealed_block.header().state_root,
+                parent_hash
+            );
+            // Update double sign metrics (both reth-bsc native and geth-compatible)
+            self.consensus_metrics.double_signs_detected_total.increment(1);
+            metrics::counter!("parlia.doublesign").increment(1);
+            return Ok(());
         }
 
         let block_hash = sealed_block.hash();
@@ -900,6 +948,9 @@ where
             parent_hash = ?parent_hash,
             txs = sealed_block.body().transaction_count(),
             gas_used = sealed_block.gas_used(),
+            build_kind = ?payload.build_kind,
+            exec_duration_ms = payload.exec_duration.as_millis(),
+            trie_root_duration_ms = payload.trie_root_duration.as_millis(),
             turn_status,
             "Submitting block"
         );
@@ -908,6 +959,27 @@ where
         use crate::metrics::BscMinerMetrics;
         use once_cell::sync::Lazy;
         static MINER_METRICS: Lazy<BscMinerMetrics> = Lazy::new(BscMinerMetrics::default);
+
+        // Count empty-fallback payloads at submission time (this preserves the signal even if the
+        // payload job saw multiple candidates).
+        if payload.build_kind == crate::node::engine::BuildKind::EmptyFallback {
+            MINER_METRICS.empty_fallback_candidates_total.increment(1);
+            warn!(
+                target: "bsc::miner",
+                block_hash = %sealed_block.hash(),
+                block_number = sealed_block.number(),
+                "Submitting empty-fallback block"
+            );
+        }
+
+        // Record payload build timings.
+        MINER_METRICS
+            .block_exec_duration_seconds
+            .record(payload.exec_duration.as_secs_f64());
+        MINER_METRICS
+            .block_trie_root_duration_seconds
+            .record(payload.trie_root_duration.as_secs_f64());
+        MINER_METRICS.blocks_produced_total.increment(1);
 
         let gas_used_mgas = sealed_block.gas_used() as f64 / 1_000_000.0;
         MINER_METRICS.best_work_gas_used_mgas.set(gas_used_mgas);
@@ -942,8 +1014,7 @@ where
         );
 
         // TODO: wait more times when huge chain import.
-        // TODO: only canonical head can broadcast, avoid sidechain blocks.
-        let parent_number = block_number.saturating_sub(1);
+        // Note: sidechain blocks are already filtered by parent canonical check above.
         let parent_td = self
             .provider
             .header_td_by_number(parent_number)
@@ -1044,7 +1115,14 @@ where
                 bid_runtime = self.bid_simulate_req_rx.recv() => {
                     match bid_runtime {
                         Some(bid_runtime) => {
-                            self.simulator.bid_simulate(bid_runtime);
+                            // A finished simulation may produce a recommit request
+                            // (go-bsc simBid defer): the follow-up simulation of a
+                            // better bid that was parked during this run.
+                            if let Some(req) = self.simulator.bid_simulate(bid_runtime) {
+                                if let Err(e) = self.bid_simulate_req_tx.send(req) {
+                                    error!("Failed to send recommit bid simulate request due to channel closed: {}", e);
+                                }
+                            }
                         }
                         None => {
                             warn!("Bid simulate request channel closed");
@@ -1057,6 +1135,8 @@ where
                 _ = send_bid_interval.tick() => {
                     // Attempt to send bids
                     self.get_bid_and_send();
+                    // Process any admitted BEP-675 BidBlocks.
+                    self.process_bid_block();
                 }
 
                 _ = clear_bid_interval.tick() => {
@@ -1080,6 +1160,19 @@ where
                     error!("Failed to send bid simulate request due to channel closed: {}", e);
                 }
             }
+        }
+    }
+
+    /// Pop an admitted BEP-675 BidBlock (from `mev_sendBidBlock`) and verify/blind-sign/seal it into
+    /// the simulator's best-bid-block store (go-bsc `newBidBlockLoop` → `AddBidBlock`).
+    fn process_bid_block(&self) {
+        if let Some(decoded) = crate::shared::pop_bid_block_package() {
+            debug!(
+                "Popped BidBlock from queue, block: {}, builder: {}",
+                decoded.block_number(),
+                decoded.builder
+            );
+            self.simulator.commit_bid_block(decoded);
         }
     }
 }
@@ -1135,6 +1228,13 @@ where
             validator_address, chain_id, desired_gas_limit, desired_min_gas_tip
         );
 
+        // Initialize dynamic miner config in shared state so miner_* RPC can update them
+        crate::shared::init_miner_dynamic_config(
+            desired_gas_limit,
+            desired_min_gas_tip as u64,
+            validator_address,
+        );
+
         let parlia = Arc::new(crate::consensus::parlia::Parlia::new(chain_spec.clone(), 200));
         let new_work_worker = NewWorkWorker::new(
             validator_address,
@@ -1154,6 +1254,7 @@ where
             snapshot_provider.clone(),
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
+            mining_config.get_no_interrupt_left_over(),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
@@ -1171,7 +1272,6 @@ where
         let result_work_worker = ResultWorkWorker::new(
             validator_address,
             provider.clone(),
-            parlia.clone(),
             payload_rx,
             mining_config.submit_built_payload,
         );
@@ -1201,10 +1301,10 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.task_executor.spawn_critical("mev_work_worker", self.mev_work_worker.run());
-        self.task_executor.spawn_critical("new_work_worker", self.new_work_worker.run());
-        self.task_executor.spawn_critical("main_work_worker", self.main_work_worker.run());
-        self.task_executor.spawn_critical("result_work_worker", self.result_work_worker.run());
+        self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
+        self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
+        self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
+        self.task_executor.spawn_critical_task("result_work_worker", self.result_work_worker.run());
         info!("Succeed to start mining, address: {}", self.validator_address);
         Ok(())
     }

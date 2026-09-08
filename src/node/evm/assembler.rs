@@ -1,6 +1,9 @@
 use crate::{
     chainspec::BscChainSpec, 
-    consensus::parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH}, 
+    consensus::{
+        eip4844::next_block_excess_blob_gas_with_mendel,
+        parlia::{Parlia, EMPTY_REQUESTS_HASH, EMPTY_WITHDRAWALS_HASH},
+    },
     hardforks::BscHardforks, 
     node::{
         evm::config::{BscBlockExecutionCtx, BscBlockExecutorFactory},
@@ -8,9 +11,9 @@ use crate::{
         primitives::{BscBlock, BscBlockBody},
     }
 };
-use alloy_consensus::{BlockBody, Header, EMPTY_OMMER_ROOT_HASH, proofs, Transaction, BlockHeader};
+use alloy_consensus::{proofs, BlockBody, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::{keccak256, B256};
-use alloy_eips::{eip7840::BlobParams, merge::BEACON_NONCE};
+use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::Bytes;
 use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -22,6 +25,7 @@ use reth_evm::{
 };
 use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
+use revm::context_interface::block::Block;
 use revm::database::BundleState;
 use std::sync::Arc;
 
@@ -32,7 +36,10 @@ use std::sync::Arc;
 /// the #[non_exhaustive] attribute on the original BlockAssemblerInput.
 pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
     /// Configuration of EVM used when executing the block.
-    pub evm_env: EvmEnv<<F::EvmFactory as reth_evm::EvmFactory>::Spec>,
+    pub evm_env: EvmEnv<
+        <F::EvmFactory as reth_evm::EvmFactory>::Spec,
+        <F::EvmFactory as reth_evm::EvmFactory>::BlockEnv,
+    >,
     /// BlockExecutorFactory::ExecutionCtx used to execute the block.
     pub execution_ctx: F::ExecutionCtx<'a>,
     /// Parent block header.
@@ -72,35 +79,40 @@ where
         }
     }
 
-    /// BSC-specific assemble_block method that accepts BscBlockAssemblerInput.
-    /// This method is completely aligned with the standard assemble_block implementation.
-    pub fn assemble_block_bsc(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) -> 
+    /// Assemble the block body only — build header fields and transaction/receipt roots but
+    /// skip `finalize_new_header()` (no difficulty, no validators, no attestation, no seal).
+    ///
+    /// The returned block has:
+    /// - `difficulty = 0`
+    /// - `extra_data = self.extra_data` (raw assembler default, no seal bytes)
+    ///
+    /// Callers must invoke `finalize_new_header()` later (e.g. in `pick_best_payload()`)
+    /// once the best payload has been chosen and all FF votes have been collected.
+    pub fn assemble_block_body_only(&self, input: BscBlockAssemblerInput<'_, '_, BscBlockExecutorFactory>) ->
         Result<crate::node::primitives::BscBlock, BlockExecutionError>
     {
-        // Get snapshot provider, return error if not available
-        let snapshot_provider = crate::shared::get_snapshot_provider()
-            .cloned()
-            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
-
         let BscBlockAssemblerInput {
             evm_env,
             execution_ctx: ctx,
             parent,
             transactions,
-            output: BlockExecutionResult { receipts, requests: _, gas_used },
+            output: BlockExecutionResult { receipts, requests: _, gas_used, .. },
             state_root,
             ..
         } = input;
 
-        // Use the base EthBlockExecutionCtx for compatibility
         let eth_ctx = ctx.as_eth_context();
-        let timestamp = evm_env.block_env.timestamp.saturating_to();
+        let timestamp = evm_env.block_env.timestamp().saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
-        let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
-        let block_number = evm_env.block_env.number.saturating_to();
+        let block_number = evm_env.block_env.number().saturating_to();
 
-        // parlia override header un-used fields.
+        let receipts_with_bloom = receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
+
+        let logs_bloom = receipts_with_bloom
+            .iter()
+            .fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+
         let mut withdrawals_root = None;
         let mut withdrawals = None;
         let mut parent_beacon_block_root = None;
@@ -122,76 +134,62 @@ where
         if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec.as_ref(), parent.number, parent.timestamp) {
-                parent.maybe_next_block_excess_blob_gas(
-                    self.chain_spec.blob_params_at_timestamp(timestamp),
-                )
-            } else {
-                // for the first post-fork block, both parent.blob_gas_used and
-                // parent.excess_blob_gas are evaluated as 0
-                Some(BlobParams::cancun().next_block_excess_blob_gas_osaka(0, 0, 0))
-            };
+            excess_blob_gas = next_block_excess_blob_gas_with_mendel(
+                self.chain_spec.as_ref(),
+                block_number,
+                timestamp,
+                parent.header(),
+                self.chain_spec.blob_params_at_timestamp(timestamp),
+            );
         }
 
-        // baseFee should only be set after London fork (EIP-1559)
-        let block_number = evm_env.block_env.number.saturating_to();
         let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
-            Some(evm_env.block_env.basefee)
+            Some(evm_env.block_env.basefee())
         } else {
             None
         };
 
-        let mut header = Header {
+        let extra_data = {
+            let ctx_extra = eth_ctx.extra_data.clone();
+            if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
+        };
+
+        let header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: evm_env.block_env.beneficiary,
+            beneficiary: evm_env.block_env.beneficiary(),
             state_root,
             transactions_root,
             receipts_root,
             withdrawals_root,
             logs_bloom,
             timestamp,
-            mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
+            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas,
             number: block_number,
-            gas_limit: evm_env.block_env.gas_limit,
-            difficulty: evm_env.block_env.difficulty,
+            gas_limit: evm_env.block_env.gas_limit(),
+            difficulty: evm_env.block_env.difficulty(),
             gas_used: *gas_used,
-            extra_data: self.extra_data.clone(),
+            extra_data,
             parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: Default::default(),
+            slot_number: None,
         };
-        
-        {   // finalize_new_header
-            let parent_header = crate::node::evm::util::HEADER_CACHE_READER
-                .lock()
-                .unwrap()
-                .get_header_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-            let parent_snap = snapshot_provider
-                .snapshot_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
-            finalize_new_header(
-                self.parlia.clone(), 
-                &parent_snap, 
-                &parent_header, 
-                &mut header,
-                &snapshot_provider,
-            ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
-            let header_hash = keccak256(alloy_rlp::encode(&header));
-            tracing::debug!("Succeed to finalize header, block_number={}, hash=0x{:x}, parent_hash=0x{:x}, txs={}", 
-                header.number, header_hash, header.parent_hash, transactions.len())
-        }
+        tracing::debug!(
+            "Assembled block body only (pre-finalize), block_number={}, parent_hash=0x{:x}, txs={}",
+            header.number, header.parent_hash, transactions.len()
+        );
 
         Ok(BscBlock {
             header,
             body: BscBlockBody {
                 inner: BlockBody { transactions, ommers: Default::default(), withdrawals },
-                sidecars: None, // BscSidecars is added to the block body in the payload builder.
+                sidecars: None,
             },
         })
     }
@@ -224,23 +222,26 @@ where
             execution_ctx: ctx,
             parent,
             transactions,
-            output: BlockExecutionResult { receipts, requests, gas_used },
+            output: BlockExecutionResult { receipts, requests, gas_used, .. },
             state_root,
             ..
         } = input;
 
         // Use the base EthBlockExecutionCtx for compatibility
         let eth_ctx = ctx.as_eth_context();
-        let timestamp = evm_env.block_env.timestamp.saturating_to();
+        let timestamp = evm_env.block_env.timestamp().saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
         let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
-        let block_number = evm_env.block_env.number.saturating_to();
+        let block_number = evm_env.block_env.number().saturating_to();
 
-        let withdrawals = self
+        let withdrawals: Option<Withdrawals> = self
             .chain_spec
             .is_shanghai_active_at_timestamp(timestamp)
-            .then(|| eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default());
+            .then(|| {
+                let v = eth_ctx.withdrawals.clone().map(|w| w.into_owned()).unwrap_or_default();
+                Withdrawals::new(v)
+            });
 
         let withdrawals_root =
             withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
@@ -254,46 +255,51 @@ where
         if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, block_number, timestamp) {
             blob_gas_used =
                 Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
-            excess_blob_gas = if BscHardforks::is_cancun_active_at_timestamp(&*self.chain_spec, parent.number, parent.timestamp) {
-                parent.maybe_next_block_excess_blob_gas(
-                    self.chain_spec.blob_params_at_timestamp(timestamp),
-                )
-            } else {
-                // for the first post-fork block, both parent.blob_gas_used and
-                // parent.excess_blob_gas are evaluated as 0
-                Some(BlobParams::cancun().next_block_excess_blob_gas_osaka(0, 0, 0))
-            };
+            excess_blob_gas = next_block_excess_blob_gas_with_mendel(
+                self.chain_spec.as_ref(),
+                block_number,
+                timestamp,
+                parent.header(),
+                self.chain_spec.blob_params_at_timestamp(timestamp),
+            );
         }
 
         // baseFee should only be set after London fork (EIP-1559)
         let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
-            Some(evm_env.block_env.basefee)
+            Some(evm_env.block_env.basefee())
         } else {
             None
+        };
+
+        let extra_data = {
+            let ctx_extra = eth_ctx.extra_data.clone();
+            if ctx_extra.is_empty() { self.extra_data.clone() } else { ctx_extra }
         };
 
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: evm_env.block_env.beneficiary,
+            beneficiary: evm_env.block_env.beneficiary(),
             state_root,
             transactions_root,
             receipts_root,
             withdrawals_root,
             logs_bloom,
             timestamp,
-            mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
+            mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas,
-            number: evm_env.block_env.number.saturating_to(),
-            gas_limit: evm_env.block_env.gas_limit,
-            difficulty: evm_env.block_env.difficulty,
+            number: evm_env.block_env.number().saturating_to(),
+            gas_limit: evm_env.block_env.gas_limit(),
+            difficulty: evm_env.block_env.difficulty(),
             gas_used: *gas_used,
-            extra_data: self.extra_data.clone(),
+            extra_data,
             parent_beacon_block_root: eth_ctx.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: Default::default(),
+            slot_number: None,
         };
         
         {   // finalize_new_header
@@ -302,15 +308,22 @@ where
                 .unwrap()
                 .get_header_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
+            let parent_header = SealedHeader::new(parent_header, header.parent_hash);
             let parent_snap = snapshot_provider
                 .snapshot_by_hash(&header.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            let block_timestamp_ms = self.parlia.block_time_for_ramanujan_fork(
+                &parent_snap,
+                parent_header.header(),
+                &header,
+            );
             finalize_new_header(
-                self.parlia.clone(), 
-                &parent_snap, 
-                &parent_header, 
+                self.parlia.clone(),
+                &parent_snap,
+                &parent_header,
                 &mut header,
                 &snapshot_provider,
+                block_timestamp_ms,
             ).map_err(|e| BlockExecutionError::msg(format!("Failed to finalize header: {}", e)))?;
 
             let header_hash = keccak256(alloy_rlp::encode(&header));

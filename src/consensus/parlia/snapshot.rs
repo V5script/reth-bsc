@@ -4,8 +4,7 @@ use super::vote::{VoteAddress, VoteAttestation, VoteData};
 use crate::metrics::BscVoteMetrics;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use once_cell::sync::Lazy;
-use reth_db::table::{Compress, Decompress};
-use reth_db::DatabaseError;
+use reth_codecs::{Compress, Decompress, DecompressError};
 use serde::{Deserialize, Serialize};
 
 /// Number of blocks after which we persist snapshots to DB.
@@ -67,6 +66,10 @@ pub struct Snapshot {
 
     /// Expected block interval in milliseconds.
     pub block_interval: u64,
+
+    /// Recent fork hashes extracted from block headers' extra data (bytes 28..32 of vanity).
+    #[serde(default)]
+    pub recent_fork_hashes: BTreeMap<BlockNumber, String>,
 }
 
 impl Snapshot {
@@ -131,6 +134,7 @@ impl Snapshot {
             vote_data: Default::default(),
             turn_length: Some(DEFAULT_TURN_LENGTH),
             block_interval: DEFAULT_BLOCK_INTERVAL,
+            recent_fork_hashes: Default::default(),
         }
     }
 
@@ -165,6 +169,21 @@ impl Snapshot {
         let limit = self.miner_history_check_len() + 1;
         if block_number >= limit {
             snap.recent_proposers.remove(&(block_number - limit));
+        }
+
+        // Maintain recent fork hash window.
+        let version_limit = self.version_history_check_len();
+        if block_number >= version_limit {
+            snap.recent_fork_hashes.remove(&(block_number - version_limit));
+        }
+
+        // Extract fork hash from header extra data bytes [28..32] (last 4 bytes of vanity).
+        let extra = next_header.extra_data();
+        if extra.len() >= super::constants::EXTRA_VANITY_LEN {
+            let fork_hash = hex::encode(
+                &extra[super::constants::EXTRA_VANITY_LEN - 4..super::constants::EXTRA_VANITY_LEN],
+            );
+            snap.recent_fork_hashes.insert(block_number, fork_hash);
         }
 
         // Validate proposer belongs to validator set and hasn't over-proposed.
@@ -292,6 +311,15 @@ impl Snapshot {
                     });
                 }
             }
+            // Clean up fork hashes that exceed the new window after validator set change
+            let old_version_len = original_snap.version_history_check_len();
+            let new_version_len = snap.version_history_check_len();
+            if new_version_len < old_version_len {
+                for i in new_version_len..old_version_len {
+                    snap.recent_fork_hashes.remove(&(block_number.saturating_sub(i)));
+                }
+            }
+
             snap.validators = new_validators;
             snap.validators_map = validators_map;
         }
@@ -323,14 +351,18 @@ impl Snapshot {
                     return;
                 }
             }
-            if att.data.source_number + 1 != att.data.target_number {
+            // Keep parity with go-bsc:
+            // only perform target-only update when the snapshot already has attestation data.
+            let has_existing_attestation = self.vote_data.source_number != 0
+                || self.vote_data.source_hash != BlockHash::ZERO
+                || self.vote_data.target_number != 0
+                || self.vote_data.target_hash != BlockHash::ZERO;
+            if has_existing_attestation && att.data.source_number + 1 != att.data.target_number {
                 self.vote_data.target_number = att.data.target_number;
                 self.vote_data.target_hash = att.data.target_hash;
             } else {
                 self.vote_data = att.data;
             }
-        } else {
-            VOTE_METRICS.attestation_update_errors_total.increment(1);
         }
     }
 
@@ -353,6 +385,13 @@ impl Snapshot {
     pub fn miner_history_check_len(&self) -> u64 {
         let turn = u64::from(self.turn_length.unwrap_or(1));
         (self.validators.len() / 2 + 1) as u64 * turn - 1
+    }
+
+    /// Number of blocks to track fork hash history.
+    /// Matches geth: validators_count * turn_length
+    pub fn version_history_check_len(&self) -> u64 {
+        let turn = u64::from(self.turn_length.unwrap_or(1));
+        self.validators.len() as u64 * turn
     }
 
     /// Validator that should propose the **next** block.
@@ -383,6 +422,16 @@ impl Snapshot {
             return true;
         }
         block_number % tl == tl - 1
+    }
+
+    /// Returns true if `block_number` is the first block of the current turn window.
+    /// When turn_length is 1 (pre-Bohr), every block is considered first in turn.
+    pub fn first_block_in_one_turn(&self, block_number: u64) -> bool {
+        let tl = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
+        if tl <= 1 {
+            return true;
+        }
+        block_number.is_multiple_of(tl)
     }
 
     /// Count how many times each validator has signed in the recent window.
@@ -448,14 +497,16 @@ impl Compress for Snapshot {
 }
 
 impl Decompress for Snapshot {
-    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
-        serde_cbor::from_slice(value).map_err(|_| DatabaseError::Decode)
+    fn decompress(value: &[u8]) -> Result<Self, DecompressError> {
+        serde_cbor::from_slice(value).map_err(DecompressError::new)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chainspec::{bsc_testnet, BscChainSpec};
+    use alloy_consensus::Header;
     use alloy_primitives::{address, b256};
 
     fn addr(n: u64) -> Address {
@@ -600,6 +651,12 @@ mod tests {
             fn requests_hash(&self) -> Option<alloy_primitives::B256> {
                 None
             }
+            fn block_access_list_hash(&self) -> Option<alloy_primitives::B256> {
+                None
+            }
+            fn slot_number(&self) -> Option<u64> {
+                None
+            }
         }
 
         impl alloy_primitives::Sealable for MockHeader {
@@ -671,5 +728,97 @@ mod tests {
         // This should not panic and should return a reasonable value
         let check_len = snapshot.miner_history_check_len();
         assert!(check_len > 0, "Check length should be positive");
+    }
+
+    #[test]
+    fn update_attestation_first_non_consecutive_vote_replaces_full_data() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let mut snapshot =
+            Snapshot::new(validators, 20, BlockHash::from([9u8; 32]), DEFAULT_EPOCH_LENGTH, None);
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+
+        let vote_data = VoteData {
+            source_number: 10,
+            source_hash: BlockHash::from([1u8; 32]),
+            target_number: 20,
+            target_hash: BlockHash::from([2u8; 32]),
+        };
+        let attestation = VoteAttestation::new_with_vote_data(vote_data);
+        let header = Header {
+            number: 21,
+            timestamp: 1,
+            parent_hash: vote_data.target_hash,
+            ..Default::default()
+        };
+
+        snapshot.update_attestation(&chain_spec, &header, Some(attestation));
+        assert_eq!(snapshot.vote_data, vote_data);
+    }
+
+    #[test]
+    fn update_attestation_non_consecutive_vote_updates_only_target_when_existing_data_present() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let mut snapshot =
+            Snapshot::new(validators, 20, BlockHash::from([9u8; 32]), DEFAULT_EPOCH_LENGTH, None);
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+
+        snapshot.vote_data = VoteData {
+            source_number: 8,
+            source_hash: BlockHash::from([3u8; 32]),
+            target_number: 9,
+            target_hash: BlockHash::from([4u8; 32]),
+        };
+
+        let vote_data = VoteData {
+            source_number: 10,
+            source_hash: BlockHash::from([1u8; 32]),
+            target_number: 20,
+            target_hash: BlockHash::from([2u8; 32]),
+        };
+        let attestation = VoteAttestation::new_with_vote_data(vote_data);
+        let header = Header {
+            number: 21,
+            timestamp: 1,
+            parent_hash: vote_data.target_hash,
+            ..Default::default()
+        };
+
+        snapshot.update_attestation(&chain_spec, &header, Some(attestation));
+        assert_eq!(snapshot.vote_data.source_number, 8);
+        assert_eq!(snapshot.vote_data.source_hash, BlockHash::from([3u8; 32]));
+        assert_eq!(snapshot.vote_data.target_number, 20);
+        assert_eq!(snapshot.vote_data.target_hash, BlockHash::from([2u8; 32]));
+    }
+
+    #[test]
+    fn update_attestation_consecutive_vote_replaces_full_data() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let mut snapshot =
+            Snapshot::new(validators, 20, BlockHash::from([9u8; 32]), DEFAULT_EPOCH_LENGTH, None);
+        let chain_spec = BscChainSpec::from(bsc_testnet());
+
+        snapshot.vote_data = VoteData {
+            source_number: 8,
+            source_hash: BlockHash::from([3u8; 32]),
+            target_number: 9,
+            target_hash: BlockHash::from([4u8; 32]),
+        };
+
+        let vote_data = VoteData {
+            source_number: 20,
+            source_hash: BlockHash::from([5u8; 32]),
+            target_number: 21,
+            target_hash: BlockHash::from([6u8; 32]),
+        };
+        let attestation = VoteAttestation::new_with_vote_data(vote_data);
+        let header = Header {
+            number: 22,
+            timestamp: 1,
+            parent_hash: vote_data.target_hash,
+            ..Default::default()
+        };
+
+        snapshot.update_attestation(&chain_spec, &header, Some(attestation));
+        assert_eq!(snapshot.vote_data, vote_data);
     }
 }

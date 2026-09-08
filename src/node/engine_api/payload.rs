@@ -1,8 +1,5 @@
 use crate::node::{engine::BscBuiltPayload, engine_api::validator::BscExecutionData};
-use reth::{
-    payload::EthPayloadBuilderAttributes,
-    primitives::{NodePrimitives, SealedBlock},
-};
+use reth::primitives::{NodePrimitives, SealedBlock};
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 
@@ -14,7 +11,6 @@ pub struct BscPayloadTypes;
 impl PayloadTypes for BscPayloadTypes {
     type BuiltPayload = BscBuiltPayload;
     type PayloadAttributes = EthPayloadAttributes;
-    type PayloadBuilderAttributes = EthPayloadBuilderAttributes;
     type ExecutionData = BscExecutionData;
 
     fn block_to_payload(
@@ -22,6 +18,7 @@ impl PayloadTypes for BscPayloadTypes {
             <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
         >,
     ) -> Self::ExecutionData {
-        BscExecutionData(block.into_block())
+        let hash = block.hash();
+        BscExecutionData::new_with_hash(block.into_block(), hash)
     }
 }

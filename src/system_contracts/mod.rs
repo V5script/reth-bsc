@@ -14,9 +14,9 @@ use alloy_primitives::{address, hex, Address, BlockNumber, Bytes, Signature, TxK
 use lazy_static::lazy_static;
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum_forks::Hardforks;
-use reth_primitives::{Transaction, TransactionSigned};
+use reth_ethereum_primitives::{Transaction, TransactionSigned};
 use revm::state::Bytecode;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tracing::info;
 
@@ -26,23 +26,41 @@ pub mod feynman_fork;
 
 pub(crate) struct SystemContract<Spec: EthChainSpec> {
     /// The validator set abi before luban.
-    validator_abi_before_luban: JsonAbi,
+    validator_abi_before_luban: Arc<JsonAbi>,
     /// The validator contract abi.
-    validator_abi: JsonAbi,
+    validator_abi: Arc<JsonAbi>,
     /// The slash abi.
-    slash_abi: JsonAbi,
+    slash_abi: Arc<JsonAbi>,
     /// The stake hub abi.
-    stake_hub_abi: JsonAbi,
+    stake_hub_abi: Arc<JsonAbi>,
     /// The chain spec.
     chain_spec: Spec,
 }
 
+lazy_static! {
+    static ref VALIDATOR_SET_ABI_BEFORE_LUBAN_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*VALIDATOR_SET_ABI_BEFORE_LUBAN)
+            .expect("validator set ABI before Luban JSON is valid")
+    );
+    static ref VALIDATOR_SET_ABI_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*VALIDATOR_SET_ABI)
+            .expect("validator set ABI JSON is valid")
+    );
+    static ref SLASH_INDICATOR_ABI_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*SLASH_INDICATOR_ABI)
+            .expect("slash indicator ABI JSON is valid")
+    );
+    static ref STAKE_HUB_ABI_JSON: Arc<JsonAbi> = Arc::new(
+        serde_json::from_str(*STAKE_HUB_ABI).expect("stake hub ABI JSON is valid")
+    );
+}
+
 impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     pub(crate) fn new(chain_spec: Spec) -> Self {
-        let validator_abi_before_luban = serde_json::from_str(*VALIDATOR_SET_ABI_BEFORE_LUBAN).unwrap();
-        let validator_abi = serde_json::from_str(*VALIDATOR_SET_ABI).unwrap();
-        let slash_abi = serde_json::from_str(*SLASH_INDICATOR_ABI).unwrap();
-        let stake_hub_abi = serde_json::from_str(*STAKE_HUB_ABI).unwrap();
+        let validator_abi_before_luban = Arc::clone(&VALIDATOR_SET_ABI_BEFORE_LUBAN_JSON);
+        let validator_abi = Arc::clone(&VALIDATOR_SET_ABI_JSON);
+        let slash_abi = Arc::clone(&SLASH_INDICATOR_ABI_JSON);
+        let stake_hub_abi = Arc::clone(&STAKE_HUB_ABI_JSON);
         Self { validator_abi_before_luban, validator_abi, slash_abi, stake_hub_abi, chain_spec }
     }
 
@@ -654,6 +672,7 @@ fn hardforks_with_system_contracts() -> Vec<BscHardfork> {
         BscHardfork::Lorentz,
         BscHardfork::Maxwell,
         BscHardfork::Fermi,
+        BscHardfork::Pasteur,
     ]
 }
 
@@ -679,6 +698,7 @@ fn hardfork_to_dir_name(hardfork: &BscHardfork) -> Result<String, SystemContract
         BscHardfork::Lorentz => "lorentz",
         BscHardfork::Maxwell => "maxwell",
         BscHardfork::Fermi => "fermi",
+        BscHardfork::Pasteur => "pasteur",
         _ => {
             return Err(SystemContractError::InvalidHardfork);
         }
@@ -1091,7 +1111,23 @@ where
             }
         }
     }
-    
+
+    if spec.is_pasteur_transition_at_timestamp(block_number, block_time, parent_block_time) {
+        if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Pasteur.name()) {
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
+                info!(
+                    target: "bsc::system_contracts::upgrade",
+                    block_number = block_number,
+                    block_time = block_time,
+                    parent_block_time = parent_block_time,
+                    address = ?address,
+                    "Pasteur upgrade contract"
+                );
+            }
+        }
+    }
+
     Ok(m)
 }
 
@@ -1107,9 +1143,14 @@ pub fn is_system_transaction<T: reth_primitives_traits::Transaction>(
     coinbase: Address,
 ) -> bool {
     let to = tx.to();
-    let max_fee_per_gas = tx.max_fee_per_gas();
+    // BSC never enforces a base fee, so pass `Some(0)` (equivalent to
+    // `EffectiveGasPriceForBSC` in go-bsc). Passing `None` here would be wrong too: alloy
+    // treats "no base fee" as "no cap", short-circuiting to `max_fee_per_gas` (the fee
+    // cap) instead of `min(max_fee_per_gas, max_priority_fee_per_gas)` — the same bug
+    // this fix removes.
+    let effective_gas_price = tx.effective_gas_price(Some(0));
     if let Some(to) = to {
-        if signer == coinbase && is_invoke_system_contract(&to) && max_fee_per_gas == 0 {
+        if signer == coinbase && is_invoke_system_contract(&to) && effective_gas_price == 0 {
             return true;
         }
     }
@@ -1120,7 +1161,107 @@ pub fn is_system_transaction<T: reth_primitives_traits::Transaction>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_consensus::TxEip1559;
+    use alloy_primitives::{address, Signature, U256};
+
+    fn dummy_sig() -> Signature {
+        Signature::new(U256::ZERO, U256::ZERO, false)
+    }
+
+    #[test]
+    fn test_is_system_transaction_uses_effective_gas_price() {
+        // BSC never enforces a base fee, so the "effective gas price" of an EIP-1559
+        // transaction is `min(max_fee_per_gas, max_priority_fee_per_gas)`. Before this
+        // fix, `is_system_transaction` checked `max_fee_per_gas` alone (the fee cap),
+        // which is wrong whenever the cap and the priority fee disagree on being zero.
+        let coinbase = address!("0x1111111111111111111111111111111111111111");
+
+        // Legacy zero-gas-price system tx: unchanged behavior, still detected.
+        let legacy = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy {
+                to: TxKind::Call(STAKE_HUB_CONTRACT),
+                gas_price: 0,
+                ..Default::default()
+            }),
+            dummy_sig(),
+        );
+        assert!(is_system_transaction(&legacy, coinbase, coinbase));
+
+        // Non-zero fee cap but zero priority fee: effective price is 0 (baseFee = 0),
+        // so this must still be detected as a system transaction.
+        let eip1559_zero_effective = TransactionSigned::new_unhashed(
+            Transaction::Eip1559(TxEip1559 {
+                to: TxKind::Call(STAKE_HUB_CONTRACT),
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 0,
+                ..Default::default()
+            }),
+            dummy_sig(),
+        );
+        assert!(is_system_transaction(&eip1559_zero_effective, coinbase, coinbase));
+
+        // Genuine non-zero priority fee: not a system transaction.
+        let eip1559_paid = TransactionSigned::new_unhashed(
+            Transaction::Eip1559(TxEip1559 {
+                to: TxKind::Call(STAKE_HUB_CONTRACT),
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1,
+                ..Default::default()
+            }),
+            dummy_sig(),
+        );
+        assert!(!is_system_transaction(&eip1559_paid, coinbase, coinbase));
+
+        // Sender other than coinbase is never a system transaction, regardless of price.
+        let not_coinbase = address!("0x2222222222222222222222222222222222222222");
+        assert!(!is_system_transaction(&legacy, not_coinbase, coinbase));
+    }
+
+    #[test]
+    fn test_pasteur_system_contract_upgrade() {
+        // The Pasteur upgrade swaps exactly StakeHub (0x2002) and Governor (0x2004) on every
+        // network, with non-empty genesis-contract v1.2.6 bytecode.
+        for spec in [bsc_mainnet(), bsc_testnet(), bsc_qanet()] {
+            let res = get_system_contract_codes(&spec, BscHardfork::Pasteur.name()).unwrap();
+            assert_eq!(res.len(), 2, "Pasteur upgrades only StakeHub and Governor");
+
+            for addr in [STAKE_HUB_CONTRACT, GOVERNOR_CONTRACT] {
+                let code = res.get(&addr).expect("contract present").as_ref().unwrap();
+                assert!(!code.original_bytes().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_pasteur_upgrade_applied_at_transition() {
+        use reth_chainspec::ForkCondition;
+
+        // Schedule Pasteur at a concrete timestamp just after Mendel and wrap in a BscChainSpec.
+        let pasteur_time = 1_777_343_400 + 1_000;
+        let mut cs = bsc_mainnet();
+        cs.hardforks.insert(BscHardfork::Pasteur, ForkCondition::Timestamp(pasteur_time));
+        let spec = crate::chainspec::BscChainSpec::from(cs);
+
+        let block = 50_000_000; // well past London activation
+
+        // Block whose parent is pre-Pasteur and itself is at/after Pasteur => the upgrade fires,
+        // swapping exactly StakeHub and Governor.
+        let upgraded =
+            get_upgrade_system_contracts(&spec, block, pasteur_time, pasteur_time - 1).unwrap();
+        assert!(upgraded.contains_key(&STAKE_HUB_CONTRACT));
+        assert!(upgraded.contains_key(&GOVERNOR_CONTRACT));
+        assert_eq!(upgraded.len(), 2);
+
+        // A block fully after Pasteur (parent already active) is not a transition => no upgrade.
+        let after =
+            get_upgrade_system_contracts(&spec, block, pasteur_time + 10, pasteur_time + 9).unwrap();
+        assert!(!after.contains_key(&STAKE_HUB_CONTRACT));
+
+        // A block fully before Pasteur is likewise not a Pasteur transition.
+        let before =
+            get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11).unwrap();
+        assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
+    }
 
     #[test]
     fn test_get_system_contract_code() {

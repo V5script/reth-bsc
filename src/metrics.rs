@@ -141,8 +141,19 @@ pub struct BscMevMetrics {
     /// Bid simulation speed in MGas/s (equivalent to bid/sim/simulateSpeed)
     pub bid_simulation_speed_mgasps: Gauge,
 
-    /// Bid simulation duration in seconds (equivalent to bid/sim/duration)
+    /// Bid simulation duration in seconds (equivalent to bid/sim/duration). Only records
+    /// simulations that ran to **completion** — aborted ones (preempted, or rejected for blob/gas
+    /// limits) return before this is observed, so its `_count` series is not the total number of
+    /// simulations. Use [`Self::bid_simulation_started_total`] for that.
     pub bid_simulation_duration_seconds: Histogram,
+
+    /// Total bid simulations **started**, counted at the single point every simulation passes
+    /// through, before it can succeed or abort. This is the denominator the interrupt-thrash ratio
+    /// is defined against ("占总模拟次数比例"): unlike
+    /// `bid_simulation_duration_seconds_count` it includes aborted runs, and unlike that histogram
+    /// series it carries no unit ambiguity — `_sum` on a `_seconds` histogram is seconds, whereas
+    /// this is a plain count.
+    pub bid_simulation_started_total: Counter,
 
     /// First bid simulation time in seconds (equivalent to bid/sim/sim1stBid)
     pub first_bid_simulation_seconds: Histogram,
@@ -152,6 +163,32 @@ pub struct BscMevMetrics {
 
     /// Total number of bid wins (when the final payload is from a bid)
     pub bid_win_total: Counter,
+
+    /// Total in-flight bid simulations preempted by a higher-value bid, i.e. every time
+    /// `canBeInterrupted` allowed a new bid through. Counted in **simulations**. Denominator for
+    /// the interrupt-thrash ratio that `no_interrupt_left_over` tuning is judged against.
+    pub bid_interrupt_total: Counter,
+
+    /// Of those preempted simulations, how many belonged to a block that then went on to seal
+    /// without any bid — the interrupts bought nothing and the node fell back to a local payload.
+    /// Counted in **simulations** too (a block that thrashed six times contributes 6, not 1), so
+    /// dividing by [`Self::bid_interrupt_total`] yields a true proportion: the share of gambles
+    /// that were wasted. A tightened `no_interrupt_left_over` window that kills good simulations it
+    /// cannot replace in time shows up here and nowhere else.
+    pub bid_interrupt_wasted_total: Counter,
+
+    /// The subset of [`Self::bid_interrupt_wasted_total`] attributable specifically to the
+    /// replacement simulation being **too late**: at seal time a simulation for this block was
+    /// still in flight. Counted in **simulations**, on the same basis as the other two, so
+    /// `late / wasted` is the share of wasted interrupts caused by the window being too tight
+    /// (versus the replacement finishing but scoring worse or being rejected — real waste, but not
+    /// evidence against `no_interrupt_left_over`).
+    ///
+    /// Attribution caveat: at most one simulation per parent runs at a time, so "still in flight"
+    /// is a single observation about the block. Crediting the block's whole tally to lateness
+    /// mirrors how `bid_interrupt_wasted_total` is weighted; in a multi-interrupt cascade the
+    /// earlier replacements did finish (only to be preempted in turn).
+    pub bid_interrupt_late_total: Counter,
 }
 
 /// Metrics for BSC miner/worker operations
@@ -166,6 +203,21 @@ pub struct BscMinerMetrics {
     /// Block finalize duration in seconds (equivalent to worker/finalizeblock)
     pub block_finalize_duration_seconds: Histogram,
 
+    /// Block execution duration in seconds (tx selection + execution; empty blocks include pre-exec changes).
+    pub block_exec_duration_seconds: Histogram,
+
+    /// Trie root computation duration in seconds (time spent in `finish()` after execution).
+    pub block_trie_root_duration_seconds: Histogram,
+
+    /// Total number of empty-payload candidates produced via the empty-fallback path.
+    ///
+    /// This is incremented when the payload job receives a completed build with
+    /// `BuildKind::EmptyFallback`.
+    pub empty_fallback_candidates_total: Counter,
+
+    /// Total number of times we ultimately failed to pick/send a best payload (block production failed).
+    pub no_best_payload_total: Counter,
+
     /// Total number of blocks produced
     pub blocks_produced_total: Counter,
 
@@ -173,6 +225,24 @@ pub struct BscMinerMetrics {
     /// This measures how long it takes from block creation to network broadcast
     /// Note: Value is stored in nanoseconds to match Golang implementation
     pub block_broadcast_delay_seconds: Histogram,
+
+    /// Total number of local payload rebuilds that were actually queued
+    pub payload_rebuilds_attempted_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because cooldown had not elapsed
+    pub payload_rebuilds_skipped_cooldown_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because estimated uplift was too low
+    pub payload_rebuilds_skipped_value_total: Counter,
+
+    /// Total number of rebuild evaluations skipped because there was not enough time left
+    pub payload_rebuilds_skipped_time_total: Counter,
+
+    /// Total number of near-deadline final-shot rebuilds used
+    pub payload_rebuilds_final_shot_total: Counter,
+
+    /// Current estimated uplift over the last local payload, in basis points
+    pub payload_rebuild_estimated_uplift_bps: Gauge,
 }
 
 /// Metrics for BSC fast finality
@@ -189,6 +259,18 @@ pub struct BscFinalityMetrics {
 
     /// Current safe block height (equivalent to chain/head/safe)
     pub safe_block_height: Gauge,
+
+    /// Early finalization latency in milliseconds (BEP-648 fast path via VotePool).
+    /// Measures the time from the finalized block's millisecond timestamp to when the
+    /// forkchoice update is triggered, equivalent to chain/finalized/latency/early in geth.
+    pub finalized_latency_early_ms: Gauge,
+
+    /// Normal finalization latency in milliseconds (attestation assembly path).
+    /// Measures the time from the source block's millisecond timestamp to when the
+    /// miner successfully assembles a vote attestation confirming it as finalized.
+    /// Equivalent to chain/finalized/latency/normal in geth (measured at assembly
+    /// time rather than import time, so slightly earlier in the pipeline).
+    pub finalized_latency_normal_ms: Gauge,
 }
 
 /// Metrics for BSC blockchain operations
@@ -223,6 +305,31 @@ pub struct BscBlockchainMetrics {
 
     /// Depth of the latest chain reorganization
     pub latest_reorg_depth: Gauge,
+}
+
+/// Chain delay metrics matching geth `chain/delay/*` metrics.
+///
+/// These track the delay between block creation (timestamp) and various events.
+/// Values are recorded in milliseconds to match geth's behavior.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "chain.delay")]
+pub struct BscChainDelayMetrics {
+    /// Delay from block timestamp to when block was first received from network
+    pub block_recv: Histogram,
+    /// Delay from block timestamp to first vote received for the block
+    pub vote_first: Histogram,
+    /// Delay from block timestamp to majority (14+) votes received for the block
+    pub vote_majority: Histogram,
+}
+
+/// Parlia consensus metrics with geth-compatible naming.
+///
+/// Separated from `BscConsensusMetrics` to match geth's `parlia/*` metric namespace.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "parlia")]
+pub struct BscParliaGethMetrics {
+    /// Double sign events detected (matches geth `parlia/doublesign`)
+    pub doublesign: Counter,
 }
 
 #[cfg(test)]

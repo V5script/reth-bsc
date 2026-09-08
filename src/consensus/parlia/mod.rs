@@ -12,8 +12,11 @@ pub mod go_rng;
 pub mod ramanujan_fork;
 pub mod bls_signer;
 pub mod forkchoice_rule;
+pub mod block_stats;
+pub mod malicious_vote_monitor;
+pub mod bid_block;
 
-#[cfg(test)]     
+#[cfg(test)]
 mod tests;  
 
 pub use snapshot::{Snapshot, ValidatorInfo, CHECKPOINT_INTERVAL};

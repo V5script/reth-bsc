@@ -41,6 +41,27 @@ make build
 make maxperf 
 ```
 
+## Testing
+
+### Ethereum Execution Spec Tests
+
+Run the [Ethereum Execution Spec Tests](https://github.com/ethereum/execution-spec-tests) to validate BSC EVM compatibility:
+
+```bash
+# Download test fixtures (v5.4.0)
+make download-eest
+
+# Run tests
+make ef-tests
+
+# Or use nextest for faster parallel execution (requires cargo-nextest)
+# Install with: cargo install cargo-nextest
+make ef-tests-nextest
+
+# Clean up test fixtures
+make clean-eest
+```
+
 ## Running
 
 ### Full Node (Recommended)
@@ -58,15 +79,6 @@ An archive node stores the complete blockchain history and state:
 ```bash
 ./target/${profile}/reth-bsc node --chain bsc --datadir ./data_dir
 ```
-
-### TrieDB Node
-
-An triedb node uses RocksDB store state data:
-
-```bash
-./target/${profile}/reth-bsc node --chain bsc --datadir ./data_dir --statedb.triedb
-```
-
 
 ### BSC Testnet
 
@@ -120,7 +132,8 @@ Sync from block 0 (will take weeks):
 
 ### 2. Snapshot Sync
 
-Refer to the [SNAPSHOT.md](https://github.com/bnb-chain/reth-bsc/blob/main/SNAPSHOT.md) for snapshot information
+- Download BSC Reth snapshots from [BSC Reth Snapshots](https://github.com/bnb-chain/bsc-snapshots#source-4-bsc-reth-snapshots)
+- For usage instructions, refer to [Usage](https://github.com/bnb-chain/bsc-snapshots/blob/main/usage/legacyfullnode_usage.md)
 
 ## Monitoring
 
@@ -168,6 +181,17 @@ This client implements the BSC upgrade-status handshake extension. When EVN is e
 - EVN activates only after the node is synced (based on head timestamp lag). Override lag threshold via `BSC_EVN_SYNC_LAG_SECS` (default 30s). Existing peers are refreshed once EVN is armed.
 
 Note: This currently affects the outgoing handshake signaling. Further EVN behaviors (e.g., peer whitelists, conditional broadcast policies) can be added incrementally.
+
+## Storage migration (v1 → v2)
+
+Existing nodes on the legacy v1 storage layout can upgrade to the v2 layout
+(static files + RocksDB) with a one-time migration:
+
+```bash
+./target/release/reth-bsc db migrate-v2 --chain bsc --datadir ./data_dir
+```
+
+See [MIGRATE_V2.md](MIGRATE_V2.md) for the full guide — what it does, requirements, verification, and troubleshooting.
 
 ## Contributing
 

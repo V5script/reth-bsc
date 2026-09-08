@@ -3,7 +3,6 @@ pub mod util;
 
 #[cfg(test)]
 mod pre_execution_tests;
-
 use crate::{
     evm::{
         api::{BscContext, BscEvm},
@@ -21,9 +20,8 @@ use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
         result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv, ContextTr,
+        BlockEnv, CfgEnv,
     },
-    context_interface::JournalTr,
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
 
@@ -32,7 +30,9 @@ mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
+pub use executor::BscBlockExecutor;
 mod factory;
+pub use factory::BscEvmFactory;
 mod patch;
 mod post_execution;
 pub mod pre_execution;
@@ -47,8 +47,13 @@ where
     type Error = EVMError<DB::Error>;
     type HaltReason = HaltReason;
     type Spec = BscHardfork;
+    type BlockEnv = BlockEnv;
     type Precompiles = PrecompilesMap;
     type Inspector = I;
+
+    fn cfg_env(&self) -> &CfgEnv<Self::Spec> {
+        &self.inner.ctx.cfg
+    }
 
     fn chain_id(&self) -> u64 {
         self.cfg.chain_id
@@ -62,32 +67,12 @@ where
         &mut self,
         mut tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        // Detect system transactions in inspect mode (for trace APIs)
-        // Normal execution: BlockExecutor filters system txs before calling transact
-        // debug_traceTransaction/debug_traceCall: detect and handle system txs here
+        // BlockExecutor filters mined system txs out before reaching here; trace
+        // RPCs do not — let `prepare` mark them idempotently for `BscHandler`.
+        self.prepare_tx_for_execution(&mut tx);
 
-        if self.trace {
-            use crate::system_contracts::is_invoke_system_contract;
-            use revm::primitives::TxKind;
-
-            tx.is_system_transaction = matches!(tx.base.kind, TxKind::Call(to)
-                if tx.base.caller == self.block.beneficiary
-                    && is_invoke_system_contract(&to)
-                    && tx.base.gas_price == 0);
-
-            // Increase beneficiary balance for system transactions in trace context
-            // Only runs when trace=true (CacheDB detected or explicit inspector used)
-            if tx.is_system_transaction {
-                let beneficiary = self.block.beneficiary;
-                if let Ok(account) = self.journal_mut().load_account(beneficiary) {
-                    account.data.info.balance = tx.base.value;
-                    account.data.mark_touch();
-                }
-            }
-        }
-
-        // Save original environment for system transactions
         let saved_env = if tx.is_system_transaction {
+            self.fund_beneficiary_for_system_tx_replay(tx.base.value);
             Some((
                 core::mem::replace(&mut self.block.gas_limit, tx.base.gas_limit),
                 core::mem::replace(&mut self.block.basefee, 0),
@@ -97,10 +82,8 @@ where
             None
         };
 
-        // Execute transaction
         let res = if self.inspect { self.inspect_tx(tx) } else { ExecuteEvm::transact(self, tx) };
 
-        // Restore environment for system transactions
         if let Some((gas_limit, basefee, disable_nonce_check)) = saved_env {
             self.block.gas_limit = gas_limit;
             self.block.basefee = basefee;
@@ -121,7 +104,7 @@ where
         Ok(ResultAndState::new(result, state))
     }
 
-    fn finish(self) -> (Self::DB, EvmEnv<Self::Spec>) {
+    fn finish(self) -> (Self::DB, EvmEnv<Self::Spec, Self::BlockEnv>) {
         let Context { block: block_env, cfg: cfg_env, journaled_state, .. } = self.inner.ctx;
 
         (journaled_state.database, EvmEnv { block_env, cfg_env })

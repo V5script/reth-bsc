@@ -19,10 +19,11 @@ use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::PooledTransactionVariant;
-use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
+use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
+use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -59,7 +60,7 @@ mod rlp {
     use alloy_primitives::U128;
     use alloy_rlp::{RlpDecodable, RlpEncodable};
     use alloy_rpc_types::Withdrawals;
-    use reth_primitives::TransactionSigned;
+    use reth_ethereum_primitives::TransactionSigned;
     use std::borrow::Cow;
 
     #[derive(RlpEncodable, RlpDecodable)]
@@ -165,6 +166,63 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
+fn apply_bsc_discv4_overrides<I>(
+    discv4_config: &mut Option<Discv4Config>,
+    boot_nodes: Option<I>,
+) where
+    I: IntoIterator<Item = NodeRecord>,
+{
+    let Some(discv4_config) = discv4_config.as_mut() else {
+        return;
+    };
+
+    if let Some(boot_nodes) = boot_nodes {
+        discv4_config.bootstrap_nodes.extend(boot_nodes);
+    }
+    discv4_config.lookup_interval = Duration::from_millis(500);
+}
+
+/// Align reth-bsc's per-peer punishment profile with geth-bsc.
+///
+/// Upstream reth treats a single ProtocolBreach as fatal
+/// (`bad_protocol = i32::MIN`) and bans for 12h; BSC mainnet's load
+/// profile fires those triggers on legitimate peers. geth-bsc has no
+/// reputation memory and runs fine. See
+/// docs/superpowers/p2p-stability-phase1.md for the full rationale.
+fn apply_bsc_peer_stability_overrides(
+    peers_config: &mut PeersConfig,
+    sessions_config: &mut SessionsConfig,
+    user_max_outbound: Option<usize>,
+) {
+    // BANNED_REPUTATION = -51200. Weights below picked so a single event
+    // does not cross it: ~4 bad_protocol, ~13 failed_to_connect, or ~50
+    // timeout/dropped events to reach ban — vs. geth-bsc which never bans.
+    peers_config.ban_duration = Duration::from_secs(60);
+    peers_config.reputation_weights.bad_protocol = -16384;
+    peers_config.reputation_weights.failed_to_connect = -4096;
+    peers_config.reputation_weights.timeout = -1024;
+    peers_config.reputation_weights.dropped = -1024;
+
+    // Soft per-request abandonment still happens at internal_request_timeout
+    // (adaptive 2-20s); this is just the deadline for declaring ProtocolBreach.
+    sessions_config.protocol_breach_request_timeout = Duration::from_secs(600);
+
+    // Tentative: widen outbound pipeline against BSC mainnet's ~5-10% dial success rate.
+    // The raised outbound cap is a default only; an explicit --max-outbound-peers or
+    // --max-peers (already baked into peers_config by the CLI) wins.
+    peers_config.connection_info.max_concurrent_outbound_dials = 64;
+    if user_max_outbound.is_none() {
+        peers_config.connection_info.max_outbound = 256;
+    }
+
+    // Tentative: 30s covers cross-region bootnode handshakes that clip at the 20s default.
+    sessions_config.pending_session_timeout = Duration::from_secs(30);
+
+    // Tentative: default 5 evicts peers permanently after 6 transient failures, which
+    // BSC mainnet's TooManyPeers/RST rate triggers in minutes; raise the floor.
+    peers_config.max_backoff_count = 32;
+}
+
 impl BscNetworkBuilder {
     pub fn new(
         engine_handle_rx: Arc<
@@ -210,15 +268,10 @@ impl BscNetworkBuilder {
         }
 
         let network_builder = ctx.network_config_builder()?;
-        let mut discv4 = Discv4Config::builder();
-
-        if let Some(boot_nodes) = ctx.chain_spec().bootnodes() {
-            discv4.add_boot_nodes(boot_nodes);
-        }
-        discv4.lookup_interval(Duration::from_millis(500));
 
         let (to_import_net, from_network) = mpsc::unbounded_channel();
         let (to_import_mined, from_builder) = mpsc::unbounded_channel();
+        let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
         let (to_network, import_outcome) = mpsc::unbounded_channel();
 
         let (to_hashes, from_hashes) = mpsc::unbounded_channel();
@@ -231,6 +284,11 @@ impl BscNetworkBuilder {
         if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
             warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
         }
+        // Expose the BEP-675 BidBlock sender so the miner can submit a selected (sealed, unexecuted)
+        // BidBlock for broadcast-then-verify (zero-simulate).
+        if crate::shared::set_bid_block_import_sender(to_import_bid.clone()).is_err() {
+            warn!(target: "bsc", "BidBlock import sender already initialised; overriding skipped");
+        }
 
         // Import the necessary types for block import service
         use crate::node::network::block_import::service::ImportService;
@@ -239,18 +297,17 @@ impl BscNetworkBuilder {
         let provider = ctx.provider().clone();
         let chain_spec = ctx.chain_spec().clone();
 
-        // Install a cached full block provider so that BSC BlocksByRange replies
-        // can include full bodies if they were recently imported. External callers
-        // can override by setting a richer provider before network starts.
+        // Install a cached full block provider so BSC BlocksByRange replies can include
+        // full bodies when blocks are in the provider (DB + canonical in-memory state),
+        // not just the broadcast-populated BODY_CACHE.
         {
-            use reth_provider::{BlockNumReader, HeaderProvider};
+            use reth_provider::BlockReader;
             struct CachedFullBlockProvider<P> {
                 inner: P,
             }
             impl<P> crate::shared::FullBlockProvider for CachedFullBlockProvider<P>
             where
-                P: HeaderProvider<Header = alloy_consensus::Header>
-                    + BlockNumReader
+                P: BlockReader<Block = crate::node::primitives::BscBlock>
                     + Clone
                     + Send
                     + Sync
@@ -260,33 +317,15 @@ impl BscNetworkBuilder {
                     &self,
                     hash: &alloy_primitives::B256,
                 ) -> Option<crate::node::primitives::BscBlock> {
-                    crate::shared::get_cached_block_by_hash(hash).or_else(|| {
-                        self.inner.header(hash).ok().flatten().map(|h| {
-                            crate::node::primitives::BscBlock {
-                                header: h,
-                                body: crate::node::primitives::BscBlockBody {
-                                    inner: reth_ethereum_primitives::BlockBody::default(),
-                                    sidecars: None,
-                                },
-                            }
-                        })
-                    })
+                    crate::shared::get_cached_block_by_hash(hash)
+                        .or_else(|| self.inner.block_by_hash(*hash).ok().flatten())
                 }
                 fn block_by_number(
                     &self,
                     number: u64,
                 ) -> Option<crate::node::primitives::BscBlock> {
-                    crate::shared::get_cached_block_by_number(number).or_else(|| {
-                        self.inner.header_by_number(number).ok().flatten().map(|h| {
-                            crate::node::primitives::BscBlock {
-                                header: h,
-                                body: crate::node::primitives::BscBlockBody {
-                                    inner: reth_ethereum_primitives::BlockBody::default(),
-                                    sidecars: None,
-                                },
-                            }
-                        })
-                    })
+                    crate::shared::get_cached_block_by_number(number)
+                        .or_else(|| self.inner.block_by_number(number).ok().flatten())
                 }
             }
 
@@ -296,7 +335,7 @@ impl BscNetworkBuilder {
         }
 
         // Spawn the critical ImportService task exactly like the official implementation
-        ctx.task_executor().spawn_critical("block import", async move {
+        ctx.task_executor().spawn_critical_task("block import", async move {
             let handle = engine_handle_rx
                 .lock()
                 .await
@@ -311,6 +350,7 @@ impl BscNetworkBuilder {
                 handle,
                 from_network,
                 from_builder,
+                from_bid_block,
                 from_hashes,
                 to_network,
             )
@@ -324,7 +364,6 @@ impl BscNetworkBuilder {
             .set_head(ctx.chain_spec().head())
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
-            .discovery(discv4)
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
@@ -337,19 +376,28 @@ impl BscNetworkBuilder {
 
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
+        apply_bsc_discv4_overrides(
+            &mut network_config.discovery_v4_config,
+            ctx.chain_spec().bootnodes(),
+        );
+        apply_bsc_peer_stability_overrides(
+            &mut network_config.peers_config,
+            &mut network_config.sessions_config,
+            ctx.config().network.resolved_max_outbound_peers(),
+        );
         network_config.status.forkid = network_config.fork_filter.current();
 
-        // Initialize BSC protocol registry with proxyed peers from config
+        // Initialize BSC protocol registry with proxied peers from config
         // This mirrors the same functionality in the main peer manager
-        let proxyed_node_ids = network_config.peers_config.proxyed_node_ids.clone();
-        if !proxyed_node_ids.is_empty() {
+        let proxied_node_ids = network_config.peers_config.proxied_node_ids.clone();
+        if !proxied_node_ids.is_empty() {
             tracing::info!(
                 target: "bsc::net",
-                count = proxyed_node_ids.len(),
-                "Initializing BSC protocol with proxyed peers"
+                count = proxied_node_ids.len(),
+                "Initializing BSC protocol with proxied peers"
             );
             crate::node::network::bsc_protocol::registry::initialize_proxyed_peers(
-                proxyed_node_ids,
+                proxied_node_ids,
             );
         }
 
@@ -399,7 +447,18 @@ where
         if crate::shared::set_local_peer_id(*local_peer_id).is_err() {
             warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
         } else {
-            info!(target: "reth::cli", peer_id=%local_peer_id, "Local peer ID set globally");
+            let node_id = alloy_primitives::keccak256(local_peer_id);
+            let node_id_short = format!(
+                "{:016x}",
+                u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes"))
+            );
+            info!(
+                target: "reth::cli",
+                peer_id = %local_peer_id,
+                node_id = %node_id,
+                node_id_short = %node_id_short,
+                "Local peer ID set globally (node_id = keccak256(peer_id); use node_id or node_id_short to grep BSC geth logs)"
+            );
         }
 
         if let Err(_h) = crate::shared::set_network_handle(handle.clone()) {
@@ -409,6 +468,7 @@ where
         if crate::node::network::evn::is_evn_enabled() {
             spawn_evn_sync_watcher(ctx, handle.clone());
         }
+
 
         Ok(handle)
     }
@@ -426,7 +486,7 @@ fn spawn_evn_sync_watcher<Node>(
         .unwrap_or(30);
     let provider = ctx.provider().clone();
     let chain_spec = ctx.chain_spec().clone();
-    ctx.task_executor().spawn_critical("evn-sync-watcher", async move {
+    ctx.task_executor().spawn_critical_task("evn-sync-watcher", async move {
         use std::time::{SystemTime, UNIX_EPOCH, Duration};
         use alloy_consensus::BlockHeader;
 
@@ -510,7 +570,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {
         let (_to, data) = crate::system_contracts::encode_add_node_ids_call(to_add.clone());
-        let mut tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+        let mut tx = reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
             chain_id: Some(chain_id),
             nonce: next_nonce,
             gas_price: 1000000000,
@@ -525,7 +585,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
         let gas = crate::shared::ipc_estimate_gas(req, None, None).await?;
         let gas_limit = std::cmp::min(gas, U256::from(u64::MAX / 2)).to::<u64>();
         debug!(target: "bsc::evn", "Estimated gas for transaction, to_add: {:?}, gas: {}, gas_limit: {}", to_add, gas, gas_limit);
-        if let reth_primitives::Transaction::Legacy(inner) = &mut tx {
+        if let reth_ethereum_primitives::Transaction::Legacy(inner) = &mut tx {
             inner.gas_limit = gas_limit;
         }
         let signed = sign_system_transaction(tx)?;
@@ -537,7 +597,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
     if !to_remove.is_empty() {
         let (_to, data) = crate::system_contracts::encode_remove_node_ids_call(to_remove.clone());
-        let mut tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+        let mut tx = reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
             chain_id: Some(chain_id),
             nonce: next_nonce,
             gas_price: 1000000000,
@@ -552,7 +612,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
         let gas = crate::shared::ipc_estimate_gas(req, None, None).await?;
         let gas_limit = std::cmp::min(gas, U256::from(u64::MAX / 2)).to::<u64>();
         debug!(target: "bsc::evn", "Estimated gas for transaction, to_remove: {:?}, gas: {}, gas_limit: {}", to_remove, gas, gas_limit);
-        if let reth_primitives::Transaction::Legacy(inner) = &mut tx {
+        if let reth_ethereum_primitives::Transaction::Legacy(inner) = &mut tx {
             inner.gas_limit = gas_limit;
         }
         let signed = sign_system_transaction(tx)?;
@@ -576,4 +636,55 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_bsc_discv4_overrides, apply_bsc_peer_stability_overrides};
+    use reth_discv4::{Discv4Config, NatResolver};
+    use reth_network::{PeersConfig, SessionsConfig};
+    use reth_network_peers::NodeRecord;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
+
+    #[test]
+    fn bsc_discv4_overrides_preserve_external_ip_resolver() {
+        let external_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        let mut discv4 = Discv4Config::builder();
+        discv4.external_ip_resolver(Some(NatResolver::ExternalIp(external_ip)));
+
+        let mut discv4 = Some(discv4.build());
+
+        apply_bsc_discv4_overrides(&mut discv4, None::<Vec<NodeRecord>>);
+
+        let discv4 = discv4.expect("discv4 config should remain enabled");
+        assert_eq!(discv4.external_ip_resolver, Some(NatResolver::ExternalIp(external_ip)));
+        assert_eq!(discv4.lookup_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn peer_stability_overrides_raise_outbound_by_default() {
+        let mut peers = PeersConfig::default();
+        let mut sessions = SessionsConfig::default();
+
+        apply_bsc_peer_stability_overrides(&mut peers, &mut sessions, None);
+
+        assert_eq!(peers.connection_info.max_outbound, 256);
+        assert_eq!(peers.connection_info.max_concurrent_outbound_dials, 64);
+    }
+
+    #[test]
+    fn peer_stability_overrides_respect_user_max_outbound() {
+        // Mirror the CLI flow: the user's --max-outbound-peers is already applied
+        // to the config before the BSC overrides run.
+        let mut peers = PeersConfig::default().with_max_outbound(50);
+        let mut sessions = SessionsConfig::default();
+
+        apply_bsc_peer_stability_overrides(&mut peers, &mut sessions, Some(50));
+
+        assert_eq!(peers.connection_info.max_outbound, 50);
+        assert_eq!(peers.connection_info.max_concurrent_outbound_dials, 64);
+    }
 }
